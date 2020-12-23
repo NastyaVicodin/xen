@@ -34,6 +34,8 @@
 
 #define XENPCID_PCIBACK_DRIVER      "pciback_driver"
 
+#include <stdbool.h>
+
 #endif /* XENPCID_H */
 
 /*
