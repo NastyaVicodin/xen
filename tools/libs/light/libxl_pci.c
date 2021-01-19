@@ -244,7 +244,7 @@ static int vchan_handle_message(libxl__gc *gc,
     switch (type)
     {
     case LIBXL__PCID_MESSAGE_TYPE_RETURN:
-        *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_ANY);
+        *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_ARRAY);
         return 0;
     case LIBXL__PCID_MESSAGE_TYPE_ERROR:
         break;
@@ -347,7 +347,7 @@ static const libxl__json_object *vchan_send_command(libxl__gc *gc,
                                                     const char *cmd,
                                                     const libxl__json_object *args)
 {
-    const libxl__json_object *result;
+    const libxl__json_object *result = NULL;
     char *json;
     int ret;
 
@@ -358,8 +358,9 @@ static const libxl__json_object *vchan_send_command(libxl__gc *gc,
     ret = vchan_write(gc, state, json);
     if ( ret < 0 )
         return NULL;
+
     ret = vchan_read_reply(gc, state, &result);
-    return NULL;
+    return result;
 }
 
 /*
@@ -830,11 +831,11 @@ out:
 {
     GC_INIT(ctx);
     libxl_pci_bdf *pcibdfs = NULL, *new;
-    struct dirent *de;
-    DIR *dir;
     struct vchan_state *vchan;
     libxl__json_object *args = NULL;
-    const libxl__json_object *result;
+    const libxl__json_object *result = NULL, *dir;
+    int i;
+    const char *dir_name;
 
     *num = 0;
 
@@ -845,21 +846,13 @@ out:
     libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_LIST_DIR_ID,
                                 XENPCID_PCIBACK_DRIVER);
     result = vchan_send_command(gc, vchan, XENPCID_CMD_LIST, args);
-    return 0;
-
-    dir = opendir(SYSFS_PCIBACK_DRIVER);
-    if (NULL == dir) {
-        if (errno == ENOENT) {
-            LOG(ERROR, "Looks like pciback driver not loaded");
-        } else {
-            LOGE(ERROR, "Couldn't open %s", SYSFS_PCIBACK_DRIVER);
-        }
+    if ( !result )
         goto out;
-    }
 
-    while((de = readdir(dir))) {
+    for (i = 0; (dir = libxl__json_array_get(result, i)); i++) {
+        dir_name = libxl__json_object_get_string(dir);
         unsigned dom, bus, dev, func;
-        if (sscanf(de->d_name, PCI_BDF, &dom, &bus, &dev, &func) != 4)
+        if (sscanf(dir_name, PCI_BDF, &dom, &bus, &dev, &func) != 4)
             continue;
 
         new = realloc(pcibdfs, ((*num) + 1) * sizeof(*new));
@@ -878,7 +871,6 @@ out:
         (*num)++;
     }
 
-    closedir(dir);
 out:
     GC_FREE;
     return pcibdfs;
