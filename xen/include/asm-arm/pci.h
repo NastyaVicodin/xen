@@ -29,7 +29,7 @@
 #include <asm/device.h>
 #include <asm/mmio.h>
 
-#ifdef CONFIG_ARM_PCI
+#ifdef CONFIG_HAS_PCI
 
 /* Arch pci dev struct */
 struct arch_pci_dev {
@@ -55,7 +55,7 @@ struct pci_config_window {
     paddr_t     size;
     uint8_t     busn_start;
     uint8_t     busn_end;
-    struct pci_ecam_ops     *ops;
+    const struct pci_ecam_ops     *ops;
     void __iomem        *win;
     /* R-Car */
     /* TODO: is it bridge or config property? */
@@ -66,15 +66,17 @@ struct pci_config_window {
 struct pci_host_bridge;
 
 struct pci_ops {
-    int (*read)(struct pci_host_bridge *bridge,
-                    uint32_t sbdf, int where, int size, u32 *val);
-    int (*write)(struct pci_host_bridge *bridge,
-                    uint32_t sbdf, int where, int size, u32 val);
-    int (*need_mapping)(struct domain *d, struct pci_host_bridge *bridge,
-                        u64 addr, u64 len);
+    void __iomem *(*map_bus)(struct pci_host_bridge *bridge, uint32_t sbdf,
+                             uint32_t offset);
+    int (*read)(struct pci_host_bridge *bridge, uint32_t sbdf,
+                uint32_t reg, uint32_t len, uint32_t *value);
+    int (*write)(struct pci_host_bridge *bridge, uint32_t sbdf,
+                 uint32_t reg, uint32_t len, uint32_t value);
     int (*register_mmio_handler)(struct domain *d,
                                  struct pci_host_bridge *bridge,
                                  const struct mmio_handler_ops *ops);
+    int (*need_mapping)(struct domain *d, struct pci_host_bridge *bridge,
+                        u64 addr, u64 len);
 };
 
 /*
@@ -84,8 +86,11 @@ struct pci_ops {
 struct pci_ecam_ops {
     unsigned int            bus_shift;
     struct pci_ops          pci_ops;
-    int             (*init)(struct pci_config_window *);
+    int (*init)(struct pci_config_window *);
 };
+
+/* default ECAM ops */
+extern const struct pci_ecam_ops pci_generic_ecam_ops;
 
 /*
  * struct to hold pci host bridge information
@@ -101,28 +106,33 @@ struct pci_host_bridge {
     const struct pci_ops *ops;
 };
 
+int pci_generic_config_read(struct pci_host_bridge *bridge, uint32_t sbdf,
+                            uint32_t reg, uint32_t len, uint32_t *value);
+
+int pci_generic_config_write(struct pci_host_bridge *bridge, uint32_t sbdf,
+                            uint32_t reg, uint32_t len, uint32_t value);
+
 struct pci_host_bridge *pci_find_host_bridge(uint16_t segment, uint8_t bus);
-struct device *pci_find_host_bridge_device(struct device *dev);
+struct dt_device_node *pci_find_host_bridge_node(struct device *dev);
 void pci_add_host_bridge(struct pci_host_bridge *bridge);
 struct pci_host_bridge * pci_alloc_host_bridge(void);
 
-
 int pci_host_common_probe(struct dt_device_node *dev,
-                struct pci_ecam_ops *ops);
-
-void pci_init(void);
+                          const struct pci_ecam_ops *ops,
+                          int ecam_reg_idx);
 bool dt_pci_parse_bus_range(struct dt_device_node *dev,
                             struct pci_config_window *cfg);
 
+void __iomem *pci_ecam_map_bus(struct pci_host_bridge *bridge,
+                               uint32_t sbdf, uint32_t where);
 int pci_host_iterate_bridges(struct domain *d,
                              int (*clb)(struct domain *d,
                                         struct pci_host_bridge *bridge));
 bool pci_host_bridge_need_mapping(struct domain *d,
                                   const struct dt_device_node *node,
                                   u64 addr, u64 len);
-bool pci_is_owner_domain(struct domain *d, u16 seg, u8 bus);
 struct domain *pci_get_owner_domain(u16 seg, u8 bus);
-#else   /*!CONFIG_ARM_PCI*/
+#else   /*!CONFIG_HAS_PCI*/
 struct arch_pci_dev { };
 static inline void  pci_init(void) { }
 static inline bool pci_host_bridge_need_mapping(struct domain *d,
@@ -131,5 +141,5 @@ static inline bool pci_host_bridge_need_mapping(struct domain *d,
 {
     return true;
 }
-#endif  /*!CONFIG_ARM_PCI*/
+#endif  /*!CONFIG_HAS_PCI*/
 #endif /* __ARM_PCI_H__ */

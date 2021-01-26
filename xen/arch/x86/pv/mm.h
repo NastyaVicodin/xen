@@ -11,16 +11,24 @@ int new_guest_cr3(mfn_t mfn);
  */
 static inline l1_pgentry_t guest_get_eff_kern_l1e(unsigned long linear)
 {
+    struct vcpu *curr = current;
+    bool user_mode = !(curr->arch.flags & TF_kernel_mode);
     l1_pgentry_t l1e;
 
-    ASSERT(!paging_mode_translate(current->domain));
-    ASSERT(!paging_mode_external(current->domain));
+    ASSERT(!paging_mode_translate(curr->domain));
+    ASSERT(!paging_mode_external(curr->domain));
+
+    if ( user_mode )
+        toggle_guest_pt(curr);
 
     if ( unlikely(!__addr_ok(linear)) ||
          __copy_from_user(&l1e,
                           &__linear_l1_table[l1_linear_offset(linear)],
                           sizeof(l1_pgentry_t)) )
         l1e = l1e_empty();
+
+    if ( user_mode )
+        toggle_guest_pt(curr);
 
     return l1e;
 }
@@ -102,8 +110,8 @@ static always_inline l1_pgentry_t adjust_guest_l1e(l1_pgentry_t l1e,
     return l1e;
 }
 
-static inline l2_pgentry_t adjust_guest_l2e(l2_pgentry_t l2e,
-                                            const struct domain *d)
+static always_inline l2_pgentry_t adjust_guest_l2e(l2_pgentry_t l2e,
+                                                   const struct domain *d)
 {
     if ( likely(l2e_get_flags(l2e) & _PAGE_PRESENT) &&
          likely(!is_pv_32bit_domain(d)) )
@@ -122,8 +130,8 @@ static always_inline l3_pgentry_t adjust_guest_l3e(l3_pgentry_t l3e,
     return l3e;
 }
 
-static inline l3_pgentry_t unadjust_guest_l3e(l3_pgentry_t l3e,
-                                              const struct domain *d)
+static always_inline l3_pgentry_t unadjust_guest_l3e(l3_pgentry_t l3e,
+                                                     const struct domain *d)
 {
     if ( unlikely(is_pv_32bit_domain(d)) &&
          likely(l3e_get_flags(l3e) & _PAGE_PRESENT) )

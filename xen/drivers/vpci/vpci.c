@@ -53,7 +53,7 @@ void vpci_remove_device_registers(struct pci_dev *pdev)
 void vpci_remove_device(struct pci_dev *pdev)
 {
     vpci_remove_device_registers(pdev);
-#ifdef CONFIG_X86
+#ifdef CONFIG_HAS_PCI_MSI
     xfree(pdev->vpci->msix);
     xfree(pdev->vpci->msi);
 #endif
@@ -90,7 +90,7 @@ int __hwdom_init vpci_add_handlers(struct pci_dev *pdev)
 }
 
 /* Notify vPCI that device is assigned to guest. */
-int vpci_assign_device(struct domain *d, struct pci_dev *dev)
+int vpci_assign_device(const struct domain *d, struct pci_dev *dev)
 {
     if ( !has_vpci(d) )
         return 0;
@@ -99,7 +99,7 @@ int vpci_assign_device(struct domain *d, struct pci_dev *dev)
 }
 
 /* Notify vPCI that device is de-assigned from guest. */
-int vpci_deassign_device(struct domain *d, struct pci_dev *dev)
+int vpci_deassign_device(const struct domain *d, struct pci_dev *dev)
 {
     if ( !has_vpci(d) )
         return 0;

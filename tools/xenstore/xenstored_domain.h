@@ -21,6 +21,8 @@
 
 void handle_event(void);
 
+void check_domains(bool restore);
+
 /* domid, mfn, eventchn, path */
 int do_introduce(struct connection *conn, struct buffered_data *in);
 
@@ -42,19 +44,21 @@ int do_get_domain_path(struct connection *conn, struct buffered_data *in);
 /* Allow guest to reset all watches */
 int do_reset_watches(struct connection *conn, struct buffered_data *in);
 
-void domain_init(void);
+void domain_init(int evtfd);
+void dom0_init(void);
+void domain_deinit(void);
 
 /* Returns the implicit path of a connection (only domains have this) */
 const char *get_implicit_path(const struct connection *conn);
-
-/* Read existing connection information from store. */
-void restore_existing_connections(void);
 
 /* Can connection attached to domain read/write. */
 bool domain_can_read(struct connection *conn);
 bool domain_can_write(struct connection *conn);
 
 bool domain_is_unprivileged(struct connection *conn);
+
+/* Remove node permissions for no longer existing domains. */
+int domain_adjust_node_perms(struct node *node);
 
 /* Quota manipulation */
 void domain_entry_inc(struct connection *conn, struct node *);
@@ -64,6 +68,11 @@ int domain_entry(struct connection *conn);
 void domain_watch_inc(struct connection *conn);
 void domain_watch_dec(struct connection *conn);
 int domain_watch(struct connection *conn);
+
+/* Special node permission handling. */
+int set_perms_special(struct connection *conn, const char *name,
+		      struct node_perms *perms);
+bool check_perms_special(const char *name, struct connection *conn);
 
 /* Write rate limiting */
 
@@ -91,5 +100,10 @@ void wrl_check_timeout(struct domain *domain,
 void wrl_log_periodic(struct wrl_timestampt now);
 void wrl_apply_debit_direct(struct connection *conn);
 void wrl_apply_debit_trans_commit(struct connection *conn);
+
+const char *dump_state_connections(FILE *fp, struct connection *conn);
+const char *dump_state_special_nodes(FILE *fp);
+
+void read_state_connection(const void *ctx, const void *state);
 
 #endif /* _XENSTORED_DOMAIN_H */

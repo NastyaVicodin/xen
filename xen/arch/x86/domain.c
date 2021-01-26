@@ -130,17 +130,25 @@ void play_dead(void)
         dead_idle();
 }
 
-static void idle_loop(void)
+static void noreturn idle_loop(void)
 {
     unsigned int cpu = smp_processor_id();
+    /*
+     * Idle vcpus might be attached to non-idle units! We don't do any
+     * standard idle work like tasklets or livepatching in this case.
+     */
+    bool guest = !is_idle_domain(current->sched_unit->domain);
 
     for ( ; ; )
     {
         if ( cpu_is_offline(cpu) )
+        {
+            ASSERT(!guest);
             play_dead();
+        }
 
         /* Are we here for running vcpu context tasklets, or for idling? */
-        if ( unlikely(tasklet_work_to_do(cpu)) )
+        if ( !guest && unlikely(tasklet_work_to_do(cpu)) )
         {
             do_tasklet();
             /* Livepatch work is always kicked off via a tasklet. */
@@ -151,28 +159,14 @@ static void idle_loop(void)
          * and then, after it is done, whether softirqs became pending
          * while we were scrubbing.
          */
-        else if ( !softirq_pending(cpu) && !scrub_free_pages()  &&
-                    !softirq_pending(cpu) )
-            pm_idle();
-        do_softirq();
-    }
-}
-
-/*
- * Idle loop for siblings in active schedule units.
- * We don't do any standard idle work like tasklets or livepatching.
- */
-static void guest_idle_loop(void)
-{
-    unsigned int cpu = smp_processor_id();
-
-    for ( ; ; )
-    {
-        ASSERT(!cpu_is_offline(cpu));
-
-        if ( !softirq_pending(cpu) && !scrub_free_pages() &&
-             !softirq_pending(cpu))
-            sched_guest_idle(pm_idle, cpu);
+        else if ( !softirq_pending(cpu) && !scrub_free_pages() &&
+                  !softirq_pending(cpu) )
+        {
+            if ( guest )
+                sched_guest_idle(pm_idle, cpu);
+            else
+                pm_idle();
+        }
         do_softirq();
     }
 }
@@ -184,15 +178,6 @@ void startup_cpu_idle_loop(void)
     ASSERT(is_idle_vcpu(v));
     cpumask_set_cpu(v->processor, v->domain->dirty_cpumask);
     write_atomic(&v->dirty_cpu, v->processor);
-
-    reset_stack_and_jump(idle_loop);
-}
-
-static void noreturn continue_idle_domain(struct vcpu *v)
-{
-    /* Idle vcpus might be attached to non-idle units! */
-    if ( !is_idle_domain(v->sched_unit->domain) )
-        reset_stack_and_jump_nolp(guest_idle_loop);
 
     reset_stack_and_jump(idle_loop);
 }
@@ -603,6 +588,7 @@ int arch_vcpu_create(struct vcpu *v)
     return rc;
 
  fail:
+    paging_vcpu_teardown(v);
     vcpu_destroy_fpu(v);
     xfree(v->arch.msrs);
     v->arch.msrs = NULL;
@@ -720,7 +706,7 @@ int arch_domain_create(struct domain *d,
         static const struct arch_csw idle_csw = {
             .from = paravirt_ctxt_switch_from,
             .to   = paravirt_ctxt_switch_to,
-            .tail = continue_idle_domain,
+            .tail = idle_loop,
         };
 
         d->arch.ctxt_switch = &idle_csw;
@@ -2057,20 +2043,12 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
     /* Ensure that the vcpu has an up-to-date time base. */
     update_vcpu_system_time(next);
 
-    /*
-     * Schedule tail *should* be a terminal function pointer, but leave a
-     * bug frame around just in case it returns, to save going back into the
-     * context switching code and leaving a far more subtle crash to diagnose.
-     */
-    nextd->arch.ctxt_switch->tail(next);
-    BUG();
+    reset_stack_and_jump_ind(nextd->arch.ctxt_switch->tail);
 }
 
 void continue_running(struct vcpu *same)
 {
-    /* See the comment above. */
-    same->domain->arch.ctxt_switch->tail(same);
-    BUG();
+    reset_stack_and_jump_ind(same->domain->arch.ctxt_switch->tail);
 }
 
 int __sync_local_execstate(void)

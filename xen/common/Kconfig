@@ -22,6 +22,9 @@ config GRANT_TABLE
 
 	  If unsure, say Y.
 
+config ARCH_ACQUIRE_RESOURCE
+	bool
+
 config HAS_ALTERNATIVE
 	bool
 
@@ -64,9 +67,6 @@ config MEM_ACCESS
 	  related events in userspace.
 
 config NEEDS_LIBELF
-	bool
-
-config NEEDS_LIST_SORT
 	bool
 
 menu "Speculative hardening"

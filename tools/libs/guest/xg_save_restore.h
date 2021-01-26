@@ -29,66 +29,6 @@
 /* When pinning page tables at the end of restore, we also use batching. */
 #define MAX_PIN_BATCH  1024
 
-/*
-** Determine various platform information required for save/restore, in
-** particular:
-**
-**    - the maximum MFN on this machine, used to compute the size of
-**      the M2P table;
-**
-**    - the starting virtual address of the the hypervisor; we use this
-**      to determine which parts of guest address space(s) do and don't
-**      require canonicalization during save/restore; and
-**
-**    - the number of page-table levels for save/ restore. This should
-**      be a property of the domain, but for the moment we just read it
-**      from the hypervisor.
-**
-**    - The width of a guest word (unsigned long), in bytes.
-**
-** Returns 1 on success, 0 on failure.
-*/
-static inline int get_platform_info(xc_interface *xch, uint32_t dom,
-                                    /* OUT */ unsigned long *max_mfn,
-                                    /* OUT */ unsigned long *hvirt_start,
-                                    /* OUT */ unsigned int *pt_levels,
-                                    /* OUT */ unsigned int *guest_width)
-{
-    xen_capabilities_info_t xen_caps = "";
-    xen_platform_parameters_t xen_params;
-
-    if (xc_version(xch, XENVER_platform_parameters, &xen_params) != 0)
-        return 0;
-
-    if (xc_version(xch, XENVER_capabilities, &xen_caps) != 0)
-        return 0;
-
-    if (xc_maximum_ram_page(xch, max_mfn))
-        return 0;
-
-    *hvirt_start = xen_params.virt_start;
-
-    if ( xc_domain_get_guest_width(xch, dom, guest_width) != 0)
-        return 0; 
-
-    /* 64-bit tools will see the 64-bit hvirt_start, but 32-bit guests 
-     * will be using the compat one. */
-    if ( *guest_width < sizeof (unsigned long) )
-        /* XXX need to fix up a way of extracting this value from Xen if
-         * XXX it becomes variable for domU */
-        *hvirt_start = 0xf5800000;
-
-    if (strstr(xen_caps, "xen-3.0-x86_64"))
-        /* Depends on whether it's a compat 32-on-64 guest */
-        *pt_levels = ( (*guest_width == 8) ? 4 : 3 );
-    else if (strstr(xen_caps, "xen-3.0-x86_32p"))
-        *pt_levels = 3;
-    else
-        return 0;
-
-    return 1;
-}
-
 
 /*
 ** Save/restore deal with the mfn_to_pfn (M2P) and pfn_to_mfn (P2M) tables.
@@ -98,26 +38,6 @@ static inline int get_platform_info(xc_interface *xch, uint32_t dom,
 
 #define PFN_TO_KB(_pfn) ((_pfn) << (PAGE_SHIFT - 10))
 
-
-/*
-** The M2P is made up of some number of 'chunks' of at least 2MB in size.
-** The below definitions and utility function(s) deal with mapping the M2P
-** regarldess of the underlying machine memory size or architecture.
-*/
-#define M2P_SHIFT       L2_PAGETABLE_SHIFT_PAE
-#define M2P_CHUNK_SIZE  (1 << M2P_SHIFT)
-#define M2P_SIZE(_m)    ROUNDUP(((_m) * sizeof(xen_pfn_t)), M2P_SHIFT)
-#define M2P_CHUNKS(_m)  (M2P_SIZE((_m)) >> M2P_SHIFT)
-
-#define UNFOLD_CR3(_c)                                                  \
-  ((uint64_t)((dinfo->guest_width == 8)                                 \
-              ? ((_c) >> 12)                                            \
-              : (((uint32_t)(_c) >> 12) | ((uint32_t)(_c) << 20))))
-
-#define FOLD_CR3(_c)                                                    \
-  ((uint64_t)((dinfo->guest_width == 8)                                 \
-              ? ((uint64_t)(_c)) << 12                                  \
-              : (((uint32_t)(_c) << 12) | ((uint32_t)(_c) >> 20))))
 
 #define MEMCPY_FIELD(_d, _s, _f, _w) do {                          \
     if ((_w) == 8)                                                 \

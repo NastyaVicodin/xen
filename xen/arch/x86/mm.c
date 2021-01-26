@@ -118,7 +118,6 @@
 #include <xen/vmap.h>
 #include <xen/xmalloc.h>
 #include <xen/efi.h>
-#include <xen/grant_table.h>
 #include <xen/hypercall.h>
 #include <xen/mm.h>
 #include <asm/paging.h>
@@ -142,10 +141,7 @@
 #include <asm/pci.h>
 #include <asm/guest.h>
 #include <asm/hvm/ioreq.h>
-
-#include <asm/hvm/grant_table.h>
 #include <asm/pv/domain.h>
-#include <asm/pv/grant_table.h>
 #include <asm/pv/mm.h>
 
 #ifdef CONFIG_PV
@@ -2199,10 +2195,11 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
             nl1e = l1e_from_page(page, l1e_get_flags(nl1e));
         }
 
+        nl1e = adjust_guest_l1e(nl1e, pt_dom);
+
         /* Fast path for sufficiently-similar mappings. */
         if ( !l1e_has_changed(ol1e, nl1e, ~FASTPATH_FLAG_WHITELIST) )
         {
-            nl1e = adjust_guest_l1e(nl1e, pt_dom);
             rc = UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
                               preserve_ad);
             if ( page )
@@ -2227,7 +2224,6 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
         if ( page )
             put_page(page);
 
-        nl1e = adjust_guest_l1e(nl1e, pt_dom);
         if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
                                     preserve_ad)) )
         {
@@ -2279,10 +2275,11 @@ static int mod_l2_entry(l2_pgentry_t *pl2e,
             return -EINVAL;
         }
 
+        nl2e = adjust_guest_l2e(nl2e, d);
+
         /* Fast path for sufficiently-similar mappings. */
         if ( !l2e_has_changed(ol2e, nl2e, ~FASTPATH_FLAG_WHITELIST) )
         {
-            nl2e = adjust_guest_l2e(nl2e, d);
             if ( UPDATE_ENTRY(l2, pl2e, ol2e, nl2e, mfn, vcpu, preserve_ad) )
                 return 0;
             return -EBUSY;
@@ -2291,7 +2288,6 @@ static int mod_l2_entry(l2_pgentry_t *pl2e,
         if ( unlikely((rc = get_page_from_l2e(nl2e, mfn, d, 0)) < 0) )
             return rc;
 
-        nl2e = adjust_guest_l2e(nl2e, d);
         if ( unlikely(!UPDATE_ENTRY(l2, pl2e, ol2e, nl2e, mfn, vcpu,
                                     preserve_ad)) )
         {
@@ -2341,10 +2337,11 @@ static int mod_l3_entry(l3_pgentry_t *pl3e,
             return -EINVAL;
         }
 
+        nl3e = adjust_guest_l3e(nl3e, d);
+
         /* Fast path for sufficiently-similar mappings. */
         if ( !l3e_has_changed(ol3e, nl3e, ~FASTPATH_FLAG_WHITELIST) )
         {
-            nl3e = adjust_guest_l3e(nl3e, d);
             rc = UPDATE_ENTRY(l3, pl3e, ol3e, nl3e, mfn, vcpu, preserve_ad);
             return rc ? 0 : -EFAULT;
         }
@@ -2354,7 +2351,6 @@ static int mod_l3_entry(l3_pgentry_t *pl3e,
             return rc;
         rc = 0;
 
-        nl3e = adjust_guest_l3e(nl3e, d);
         if ( unlikely(!UPDATE_ENTRY(l3, pl3e, ol3e, nl3e, mfn, vcpu,
                                     preserve_ad)) )
         {
@@ -2403,10 +2399,11 @@ static int mod_l4_entry(l4_pgentry_t *pl4e,
             return -EINVAL;
         }
 
+        nl4e = adjust_guest_l4e(nl4e, d);
+
         /* Fast path for sufficiently-similar mappings. */
         if ( !l4e_has_changed(ol4e, nl4e, ~FASTPATH_FLAG_WHITELIST) )
         {
-            nl4e = adjust_guest_l4e(nl4e, d);
             rc = UPDATE_ENTRY(l4, pl4e, ol4e, nl4e, mfn, vcpu, preserve_ad);
             return rc ? 0 : -EFAULT;
         }
@@ -2416,7 +2413,6 @@ static int mod_l4_entry(l4_pgentry_t *pl4e,
             return rc;
         rc = 0;
 
-        nl4e = adjust_guest_l4e(nl4e, d);
         if ( unlikely(!UPDATE_ENTRY(l4, pl4e, ol4e, nl4e, mfn, vcpu,
                                     preserve_ad)) )
         {
@@ -4589,114 +4585,6 @@ static int handle_iomem_range(unsigned long s, unsigned long e, void *p)
     } while ( !err );
 
     return err || s > e ? err : _handle_iomem_range(s, e, p);
-}
-
-int xenmem_add_to_physmap_one(
-    struct domain *d,
-    unsigned int space,
-    union add_to_physmap_extra extra,
-    unsigned long idx,
-    gfn_t gpfn)
-{
-    struct page_info *page = NULL;
-    unsigned long gfn = 0 /* gcc ... */, old_gpfn;
-    mfn_t prev_mfn;
-    int rc = 0;
-    mfn_t mfn = INVALID_MFN;
-    p2m_type_t p2mt;
-
-    switch ( space )
-    {
-        case XENMAPSPACE_shared_info:
-            if ( idx == 0 )
-                mfn = virt_to_mfn(d->shared_info);
-            break;
-        case XENMAPSPACE_grant_table:
-            rc = gnttab_map_frame(d, idx, gpfn, &mfn);
-            if ( rc )
-                return rc;
-            break;
-        case XENMAPSPACE_gmfn:
-        {
-            p2m_type_t p2mt;
-
-            gfn = idx;
-            mfn = get_gfn_unshare(d, gfn, &p2mt);
-            /* If the page is still shared, exit early */
-            if ( p2m_is_shared(p2mt) )
-            {
-                put_gfn(d, gfn);
-                return -ENOMEM;
-            }
-            page = get_page_from_mfn(mfn, d);
-            if ( unlikely(!page) )
-                mfn = INVALID_MFN;
-            break;
-        }
-        case XENMAPSPACE_gmfn_foreign:
-            return p2m_add_foreign(d, idx, gfn_x(gpfn), extra.foreign_domid);
-        default:
-            break;
-    }
-
-    if ( mfn_eq(mfn, INVALID_MFN) )
-    {
-        rc = -EINVAL;
-        goto put_both;
-    }
-
-    /* Remove previously mapped page if it was present. */
-    prev_mfn = get_gfn(d, gfn_x(gpfn), &p2mt);
-    if ( mfn_valid(prev_mfn) )
-    {
-        if ( is_special_page(mfn_to_page(prev_mfn)) )
-            /* Special pages are simply unhooked from this phys slot. */
-            rc = guest_physmap_remove_page(d, gpfn, prev_mfn, PAGE_ORDER_4K);
-        else if ( !mfn_eq(mfn, prev_mfn) )
-            /* Normal domain memory is freed, to avoid leaking memory. */
-            rc = guest_remove_page(d, gfn_x(gpfn));
-    }
-    /* In the XENMAPSPACE_gmfn case we still hold a ref on the old page. */
-    put_gfn(d, gfn_x(gpfn));
-
-    if ( rc )
-        goto put_both;
-
-    /* Unmap from old location, if any. */
-    old_gpfn = get_gpfn_from_mfn(mfn_x(mfn));
-    ASSERT(!SHARED_M2P(old_gpfn));
-    if ( space == XENMAPSPACE_gmfn && old_gpfn != gfn )
-    {
-        rc = -EXDEV;
-        goto put_both;
-    }
-    if ( old_gpfn != INVALID_M2P_ENTRY )
-        rc = guest_physmap_remove_page(d, _gfn(old_gpfn), mfn, PAGE_ORDER_4K);
-
-    /* Map at new location. */
-    if ( !rc )
-        rc = guest_physmap_add_page(d, gpfn, mfn, PAGE_ORDER_4K);
-
- put_both:
-    /*
-     * In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top.
-     * We also may need to transfer ownership of the page reference to our
-     * caller.
-     */
-    if ( space == XENMAPSPACE_gmfn )
-    {
-        put_gfn(d, gfn);
-        if ( !rc && extra.ppage )
-        {
-            *extra.ppage = page;
-            page = NULL;
-        }
-    }
-
-    if ( page )
-        put_page(page);
-
-    return rc;
 }
 
 int arch_acquire_resource(struct domain *d, unsigned int type,

@@ -2,12 +2,6 @@
  * xen/arch/arm/vpci.c
  * Copyright (c) 2020 Arm Ltd.
  *
- * Based on arch/x86/hvm/io.c
- * Copyright (c) 2004, Intel Corporation.
- * Copyright (c) 2005, International Business Machines Corporation.
- * Copyright (c) 2008, Citrix Systems, Inc.
- *
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or

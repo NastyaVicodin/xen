@@ -8,8 +8,8 @@
 #define __X86_CURRENT_H__
 
 #include <xen/percpu.h>
+#include <xen/page-size.h>
 #include <public/xen.h>
-#include <asm/page.h>
 
 /*
  * Xen's cpu stacks are 8 pages (8-page aligned), arranged as:
@@ -120,6 +120,14 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
 
 #ifdef CONFIG_LIVEPATCH
 # define CHECK_FOR_LIVEPATCH_WORK "call check_for_livepatch_work;"
+#elif defined(CONFIG_DEBUG)
+/* Mimic the clobbering effect a call has on registers. */
+# define CHECK_FOR_LIVEPATCH_WORK \
+    "mov $0x1234567890abcdef, %%rax\n\t" \
+    "mov %%rax, %%rcx; mov %%rax, %%rdx\n\t" \
+    "mov %%rax, %%rsi; mov %%rax, %%rdi\n\t" \
+    "mov %%rax, %%r8; mov %%rax, %%r9\n\t" \
+    "mov %%rax, %%r10; mov %%rax, %%r11\n\t"
 #else
 # define CHECK_FOR_LIVEPATCH_WORK ""
 #endif
@@ -155,18 +163,27 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
 # define SHADOW_STACK_WORK ""
 #endif
 
-#define switch_stack_and_jump(fn, instr)                                \
+#if __GNUC__ >= 9
+# define ssaj_has_attr_noreturn(fn) __builtin_has_attribute(fn, __noreturn__)
+#else
+/* Simply can't check the property with older gcc. */
+# define ssaj_has_attr_noreturn(fn) true
+#endif
+
+#define switch_stack_and_jump(fn, instr, constr)                        \
     ({                                                                  \
         unsigned int tmp;                                               \
+        (void)((fn) == (void (*)(void))NULL);                           \
+        BUILD_BUG_ON(!ssaj_has_attr_noreturn(fn));                      \
         __asm__ __volatile__ (                                          \
             SHADOW_STACK_WORK                                           \
             "mov %[stk], %%rsp;"                                        \
-            instr                                                       \
-            "jmp %c[fun];"                                              \
+            CHECK_FOR_LIVEPATCH_WORK                                    \
+            instr "[fun]"                                               \
             : [val] "=&r" (tmp),                                        \
               [ssp] "=&r" (tmp)                                         \
             : [stk] "r" (guest_cpu_user_regs()),                        \
-              [fun] "i" (fn),                                           \
+              [fun] constr (fn),                                        \
               [skstk_base] "i"                                          \
               ((PRIMARY_SHSTK_SLOT + 1) * PAGE_SIZE - 8),               \
               [stack_mask] "i" (STACK_SIZE - 1),                        \
@@ -177,10 +194,11 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
     })
 
 #define reset_stack_and_jump(fn)                                        \
-    switch_stack_and_jump(fn, CHECK_FOR_LIVEPATCH_WORK)
+    switch_stack_and_jump(fn, "jmp %c", "i")
 
-#define reset_stack_and_jump_nolp(fn)                                   \
-    switch_stack_and_jump(fn, "")
+/* The constraint may only specify non-call-clobbered registers. */
+#define reset_stack_and_jump_ind(fn)                                    \
+    switch_stack_and_jump(fn, "INDIRECT_JMP %", "b")
 
 /*
  * Which VCPU's state is currently running on each CPU?

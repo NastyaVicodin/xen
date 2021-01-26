@@ -99,7 +99,7 @@ register_t get_default_hcr_flags(void)
 {
     return  (HCR_PTW|HCR_BSU_INNER|HCR_AMO|HCR_IMO|HCR_FMO|HCR_VM|
              (vwfi != NATIVE ? (HCR_TWI|HCR_TWE) : 0) |
-             HCR_TSC|HCR_TAC|HCR_SWIO|HCR_TIDCP|HCR_FB|HCR_TSW);
+             HCR_TID3|HCR_TSC|HCR_TAC|HCR_SWIO|HCR_TIDCP|HCR_FB|HCR_TSW);
 }
 
 static enum {
@@ -176,14 +176,14 @@ static void print_xen_info(void)
 {
     char taint_str[TAINT_STRING_MAX_LEN];
 
-    printk("----[ Xen-%d.%d%s  %s  debug=%c " gcov_string "  %s ]----\n",
+    printk("----[ Xen-%d.%d%s  %s  %s  %s ]----\n",
            xen_major_version(), xen_minor_version(), xen_extra_version(),
 #ifdef CONFIG_ARM_32
            "arm32",
 #else
            "arm64",
 #endif
-           debug_build() ? 'y' : 'n', print_tainted(taint_str));
+           xen_build_info(), print_tainted(taint_str));
 }
 
 #ifdef CONFIG_ARM_32
@@ -2097,6 +2097,11 @@ void do_trap_guest_sync(struct cpu_user_regs *regs)
         GUEST_BUG_ON(!psr_mode_is_32bit(regs));
         perfc_incr(trap_cp14_dbg);
         do_cp14_dbg(regs, hsr);
+        break;
+    case HSR_EC_CP10:
+        GUEST_BUG_ON(!psr_mode_is_32bit(regs));
+        perfc_incr(trap_cp10);
+        do_cp10(regs, hsr);
         break;
     case HSR_EC_CP:
         GUEST_BUG_ON(!psr_mode_is_32bit(regs));

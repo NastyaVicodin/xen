@@ -29,6 +29,8 @@
 #include <xen/sched.h>
 #include <xen/vmap.h>
 
+bool pci_under_qemu;
+
 /*
  * List for all the pci host bridges.
  */
@@ -66,7 +68,8 @@ static void pci_ecam_free(struct pci_config_window *cfg)
 }
 
 static struct pci_config_window *gen_pci_init(struct dt_device_node *dev,
-        struct pci_ecam_ops *ops)
+                                              const struct pci_ecam_ops *ops,
+                                              int ecam_reg_idx)
 {
     int err;
     struct pci_config_window *cfg;
@@ -87,7 +90,7 @@ static struct pci_config_window *gen_pci_init(struct dt_device_node *dev,
     }
 
     /* Parse our PCI ecam register address*/
-    err = dt_device_get_address(dev, 0, &addr, &size);
+    err = dt_device_get_address(dev, ecam_reg_idx, &addr, &size);
     if ( err )
         goto err_exit;
 
@@ -124,7 +127,7 @@ err_exit:
     return NULL;
 }
 
-struct pci_host_bridge * pci_alloc_host_bridge(void)
+struct pci_host_bridge *pci_alloc_host_bridge(void)
 {
     struct pci_host_bridge *bridge = xzalloc(struct pci_host_bridge);
 
@@ -143,20 +146,25 @@ void pci_add_host_bridge(struct pci_host_bridge *bridge)
 }
 
 int pci_host_common_probe(struct dt_device_node *dev,
-        struct pci_ecam_ops *ops)
+                          const struct pci_ecam_ops *ops,
+                          int ecam_reg_idx)
 {
     struct pci_host_bridge *bridge;
     struct pci_config_window *cfg;
     u32 segment;
+    int err;
 
     bridge = pci_alloc_host_bridge();
     if ( !bridge )
         return -ENOMEM;
 
     /* Parse and map our Configuration Space windows */
-    cfg = gen_pci_init(dev, ops);
+    cfg = gen_pci_init(dev, ops, ecam_reg_idx);
     if ( !cfg )
-        return -ENOMEM;
+    {
+        err = -ENOMEM;
+        goto err_exit;
+    }
 
     bridge->dt_node = dev;
     bridge->sysdata = cfg;
@@ -166,8 +174,12 @@ int pci_host_common_probe(struct dt_device_node *dev,
 
     if( !dt_property_read_u32(dev, "linux,pci-domain", &segment) )
     {
-        printk(XENLOG_ERR "\"linux,pci-domain\" property in not available in DT\n");
-        return -ENODEV;
+        static u32 next_seg = 0;
+
+        printk(XENLOG_ERR
+               "\"linux,pci-domain\" property in not available in DT. Assigning %d\n",
+               next_seg);
+        segment = next_seg++;
     }
 
     bridge->segment = (u16)segment;
@@ -175,6 +187,10 @@ int pci_host_common_probe(struct dt_device_node *dev,
     pci_add_host_bridge(bridge);
 
     return 0;
+
+err_exit:
+    xfree(bridge);
+    return err;
 }
 
 /*
@@ -184,7 +200,6 @@ int pci_host_common_probe(struct dt_device_node *dev,
 struct pci_host_bridge *pci_find_host_bridge(uint16_t segment, uint8_t bus)
 {
     struct pci_host_bridge *bridge;
-    bool found = false;
 
     list_for_each_entry( bridge, &pci_host_bridges, node )
     {
@@ -192,30 +207,10 @@ struct pci_host_bridge *pci_find_host_bridge(uint16_t segment, uint8_t bus)
             continue;
         if ( (bus < bridge->bus_start) || (bus > bridge->bus_end) )
             continue;
-
-        found = true;
-        break;
+        return bridge;
     }
 
-    return (found) ? bridge : NULL;
-}
-
-/*
- * Get host bridge device given a device attached to it.
- */
-struct device *pci_find_host_bridge_device(struct device *dev)
-{
-    struct pci_host_bridge *bridge;
-    struct pci_dev *pdev = dev_to_pci(dev);
-
-    bridge = pci_find_host_bridge(pdev->seg, pdev->bus);
-    if ( unlikely(!bridge) )
-    {
-        printk(XENLOG_ERR "Unable to find PCI bridge for "PRI_pci"\n",
-               pdev->seg, pdev->bus, pdev->sbdf.dev, pdev->sbdf.fn);
-        return NULL;
-    }
-    return dt_to_dev(bridge->dt_node);
+    return NULL;
 }
 
 int pci_host_iterate_bridges(struct domain *d,
@@ -239,29 +234,27 @@ bool pci_host_bridge_need_mapping(struct domain *d,
                                   u64 addr, u64 len)
 {
     struct pci_host_bridge *bridge;
-    struct pci_dev *pdev = dev_to_pci((struct device *)&node->dev);
 
-    bridge = pci_find_host_bridge(pdev->seg, pdev->bus);
-    if ( unlikely(!bridge) )
+    list_for_each_entry( bridge, &pci_host_bridges, node )
     {
-        printk(XENLOG_ERR "Unable to find PCI bridge for "PRI_pci"\n",
-               pdev->seg, pdev->bus, pdev->sbdf.dev, pdev->sbdf.fn);
-        return NULL;
+        if ( bridge->dt_node != node )
+            continue;
+
+        if ( !bridge->ops->need_mapping )
+            return true;
+
+        return bridge->ops->need_mapping(d, bridge, addr, len);
     }
-
-    if ( !bridge->ops->need_mapping )
-        return true;
-
-    return bridge->ops->need_mapping(d, bridge, addr, len);
+    printk(XENLOG_ERR "Unable to find PCI bridge for %s segment %d, addr %lx\n",
+           node->full_name, bridge->segment, addr);
+    return true;
 }
-
-extern bool pci_under_qemu;
 
 /*
  * Check if the domain owns the PCI host bridge with the segment
  * and bus given.
  */
-bool pci_is_owner_domain(struct domain *d, u16 seg, u8 bus)
+bool pci_is_owner_domain(const struct domain *d, u16 seg, u8 bus)
 {
     struct pci_host_bridge *bridge = pci_find_host_bridge(seg, bus);
 
@@ -293,6 +286,23 @@ struct domain *pci_get_owner_domain(u16 seg, u8 bus)
 #endif
 }
 
+/*
+ * Get host bridge node given a device attached to it.
+ */
+struct dt_device_node *pci_find_host_bridge_node(struct device *dev)
+{
+    struct pci_host_bridge *bridge;
+    struct pci_dev *pdev = dev_to_pci(dev);
+
+    bridge = pci_find_host_bridge(pdev->seg, pdev->bus);
+    if ( unlikely(!bridge) )
+    {
+        printk(XENLOG_ERR "Unable to find PCI bridge for "PRI_pci"\n",
+               pdev->seg, pdev->bus, pdev->sbdf.dev, pdev->sbdf.fn);
+        return NULL;
+    }
+    return bridge->dt_node;
+}
 /*
  * Local variables:
  * mode: C

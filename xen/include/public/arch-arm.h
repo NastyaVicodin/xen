@@ -419,6 +419,10 @@ typedef uint64_t xen_callback_t;
 #define GUEST_GICV3_GICR0_BASE     xen_mk_ullong(0x03020000) /* vCPU0..127 */
 #define GUEST_GICV3_GICR0_SIZE     xen_mk_ullong(0x01000000)
 
+/* vGIC ITS mappings */
+#define GUEST_GICV3_ITS_BASE   xen_mk_ullong(0x04020000)
+#define GUEST_GICV3_ITS_SIZE   xen_mk_ullong(0x00020000)
+
 /* ACPI tables physical address */
 #define GUEST_ACPI_BASE xen_mk_ullong(0x20000000)
 #define GUEST_ACPI_SIZE xen_mk_ullong(0x02000000)
@@ -440,17 +444,17 @@ typedef uint64_t xen_callback_t;
 #define GUEST_VPCI_ADDR_TYPE_IO           xen_mk_ullong(0x01000000)
 
 /* Guest PCI-PCIe memory space where config space and BAR will be available.*/
-#define GUEST_VPCI_PREFETCH_MEM_CPU_ADDR  xen_mk_ullong(0x4000000000)
-#define GUEST_VPCI_MEM_CPU_ADDR           xen_mk_ullong(0x04020000)
-#define GUEST_VPCI_IO_CPU_ADDR            xen_mk_ullong(0xC0200800)
+#define GUEST_VPCI_PREFETCH_MEM_CPU_ADDR  xen_mk_ullong(0x900000000)
+#define GUEST_VPCI_MEM_CPU_ADDR           xen_mk_ullong(0x20000000)
+#define GUEST_VPCI_IO_CPU_ADDR            xen_mk_ullong(0x2f800000)
 
-#define GUEST_VPCI_PREFETCH_MEM_PCI_ADDR  xen_mk_ullong(0x4000000000)
-#define GUEST_VPCI_MEM_PCI_ADDR           xen_mk_ullong(0x04020000)
+#define GUEST_VPCI_PREFETCH_MEM_PCI_ADDR  xen_mk_ullong(0x900000000)
+#define GUEST_VPCI_MEM_PCI_ADDR           xen_mk_ullong(0x20000000)
 #define GUEST_VPCI_IO_PCI_ADDR            xen_mk_ullong(0x00000000)
 
-#define GUEST_VPCI_PREFETCH_MEM_SIZE      xen_mk_ullong(0x100000000)
-#define GUEST_VPCI_MEM_SIZE               xen_mk_ullong(0x08000000)
-#define GUEST_VPCI_IO_SIZE                xen_mk_ullong(0x00800000)
+#define GUEST_VPCI_PREFETCH_MEM_SIZE      xen_mk_ullong(0x2000000000)
+#define GUEST_VPCI_MEM_SIZE               xen_mk_ullong(0x04000000)
+#define GUEST_VPCI_IO_SIZE                xen_mk_ullong(0x00010000)
 
 /*
  * 16MB == 4096 pages reserved for guest to use as a region to map its

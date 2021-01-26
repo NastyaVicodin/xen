@@ -21,10 +21,18 @@
 #include <xen/pci.h>
 #include <xen/param.h>
 
+int arch_pci_clean_pirqs(struct domain *d)
+{
+    return 0;
+}
+
 struct pci_dev *dev_to_pci(struct device *dev)
 {
-    struct arch_pci_dev *arch_dev =
-        container_of((dev), struct arch_pci_dev, dev);
+    struct arch_pci_dev *arch_dev;
+
+    ASSERT(dev->type == DEV_PCI);
+
+    arch_dev = container_of((dev), struct arch_pci_dev, dev);
     return container_of(arch_dev, struct pci_dev, arch);
 }
 
@@ -87,26 +95,24 @@ static int __init parse_pci_param(const char *arg)
 }
 custom_param("pci", parse_pci_param);
 
-void __init pci_init(void)
+static int __init pci_init(void)
 {
     /*
      * Enable PCI when has been enabled explicitly (pci=on)
      */
     if ( !param_pci_enable)
-        goto disable;
+        return 0;
 
     if ( acpi_disabled )
         dt_pci_init();
     else
         acpi_pci_init();
 
-#ifdef CONFIG_HAS_PCI
     pci_segments_init();
-#endif
 
-disable:
-    return;
+    return 0;
 }
+__initcall(pci_init);
 
 /*
  * Local variables:

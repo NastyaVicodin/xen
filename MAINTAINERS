@@ -486,7 +486,7 @@ M:	Tamas K Lengyel <tamas@tklengyel.com>
 R:	Alexandru Isaila <aisaila@bitdefender.com>
 R:	Petre Pircalabu <ppircalabu@bitdefender.com>
 S:	Supported
-F:	tools/tests/xen-access
+F:	tools/misc/xen-access.c
 F:	xen/arch/*/monitor.c
 F:	xen/arch/*/vm_event.c
 F:	xen/arch/arm/mem_access.c
@@ -583,6 +583,13 @@ F:	xen/include/asm-x86/guest/hyperv.h
 F:	xen/include/asm-x86/guest/hyperv-hcall.h
 F:	xen/include/asm-x86/guest/hyperv-tlfs.h
 F:	xen/include/asm-x86/hvm/viridian.h
+
+XENSTORE
+M:	Ian Jackson <iwj@xenproject.org>
+M:	Wei Liu <wl@xen.org>
+M:	Juergen Gross <jgross@suse.com>
+S:	Supported
+F:	tools/xenstore/
 
 XENTRACE
 M:	George Dunlap <george.dunlap@citrix.com>

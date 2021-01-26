@@ -23,9 +23,6 @@
 #include <xen/iommu.h>
 #include <xen/irq.h>
 #include <xen/param.h>
-#ifndef CONFIG_ARM
-#include <asm/hvm/irq.h>
-#endif
 #include <xen/delay.h>
 #include <xen/keyhandler.h>
 #include <xen/event.h>
@@ -36,7 +33,7 @@
 #include <xen/tasklet.h>
 #include <xen/vpci.h>
 #include <xsm/xsm.h>
-#ifndef CONFIG_ARM
+#ifdef CONFIG_HAS_PCI_MSI
 #include <asm/msi.h>
 #endif
 #include "ats.h"
@@ -334,10 +331,9 @@ static struct pci_dev *alloc_pdev(struct pci_seg *pseg, u8 bus, u8 devfn)
     pdev->domain = NULL;
     INIT_LIST_HEAD(&pdev->msi_list);
 
+#ifdef CONFIG_HAS_PCI_MSI
     pos = pci_find_cap_offset(pseg->nr, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
                               PCI_CAP_ID_MSI);
-#ifndef CONFIG_ARM
-    /*TODO :Implement MSI support for ARM  */
     if ( pos )
     {
         uint16_t ctrl = pci_conf_read16(pdev->sbdf, msi_control_reg(pos));
@@ -597,8 +593,6 @@ struct pci_dev *pci_get_pdev_by_domain(const struct domain *d, int seg,
     return NULL;
 }
 
-#ifndef CONFIG_ARM
-/*TODO :Need to investigate the ACS support for ARM  */
 /**
  * pci_enable_acs - enable ACS if hardware support it
  * @dev: the PCI device
@@ -633,7 +627,6 @@ static void pci_enable_acs(struct pci_dev *pdev)
 
     pci_conf_write16(pdev->sbdf, pos + PCI_ACS_CTRL, ctrl);
 }
-#endif
 
 static int iommu_add_device(struct pci_dev *pdev);
 static int iommu_enable_device(struct pci_dev *pdev);
@@ -809,9 +802,7 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
         goto out;
     }
 #endif
-#ifndef CONFIG_ARM
     pci_enable_acs(pdev);
-#endif
 
 out:
     pcidevs_unlock();
@@ -849,8 +840,7 @@ int pci_remove_device(u16 seg, u8 bus, u8 devfn)
     list_for_each_entry ( pdev, &pseg->alldevs_list, alldevs_list )
         if ( pdev->bus == bus && pdev->devfn == devfn )
         {
-#ifndef CONFIG_ARM
-            /*TODO :Implement MSI support for ARM  */
+#ifdef CONFIG_HAS_PCI_MSI
             pci_cleanup_msi(pdev);
 #endif
             ret = iommu_remove_device(pdev);
@@ -1301,8 +1291,7 @@ bool_t pcie_aer_get_firmware_first(const struct pci_dev *pdev)
 static int _dump_pci_devices(struct pci_seg *pseg, void *arg)
 {
     struct pci_dev *pdev;
-#ifndef CONFIG_ARM
-    /*TODO :Implement MSI support for ARM  */
+#ifdef CONFIG_HAS_PCI_MSI
     struct msi_desc *msi;
 #endif
 
@@ -1313,8 +1302,7 @@ static int _dump_pci_devices(struct pci_seg *pseg, void *arg)
         printk("%pp - %pd - node %-3d - MSIs < ",
                &pdev->sbdf, pdev->domain,
                (pdev->node != NUMA_NO_NODE) ? pdev->node : -1);
-#ifndef CONFIG_ARM
-        /*TODO :Implement MSI support for ARM  */
+#ifdef CONFIG_HAS_PCI_MSI
         list_for_each_entry ( msi, &pdev->msi_list, list )
                printk("%d ", msi->irq);
 #endif
@@ -1339,8 +1327,7 @@ static int __init setup_dump_pcidevs(void)
 }
 __initcall(setup_dump_pcidevs);
 
-#ifndef CONFIG_ARM
-/*TODO :Implement MSI support for ARM  */
+#ifdef CONFIG_HAS_PCI_MSI
 int iommu_update_ire_from_msi(
     struct msi_desc *msi_desc, struct msi_msg *msg)
 {
@@ -1366,17 +1353,32 @@ static int iommu_add_device(struct pci_dev *pdev)
 
 #ifdef CONFIG_ARM
     pci_to_dev(pdev)->type = DEV_PCI;
-#endif
+    rc = iommu_add_pci_device(pdev->devfn, pdev);
+    if ( rc > 0 )
+        rc = 0;
+#else
     rc = hd->platform_ops->add_device(pdev->devfn, pci_to_dev(pdev));
+#endif
     if ( rc || !pdev->phantom_stride )
+    {
+        if ( rc )
+            printk(XENLOG_WARNING "IOMMU: add %pp failed (%d)\n",
+                   &pdev->sbdf, rc);
         return rc;
+    }
 
     for ( devfn = pdev->devfn ; ; )
     {
         devfn += pdev->phantom_stride;
         if ( PCI_SLOT(devfn) != PCI_SLOT(pdev->devfn) )
             return 0;
+#ifdef CONFIG_ARM
+        rc = iommu_add_pci_device(devfn, pdev);
+        if ( rc > 0 )
+            rc = 0;
+#else
         rc = hd->platform_ops->add_device(devfn, pci_to_dev(pdev));
+#endif
         if ( rc )
             printk(XENLOG_WARNING "IOMMU: add %pp failed (%d)\n",
                    &pdev->sbdf, rc);
@@ -1471,8 +1473,7 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
     ASSERT(pdev && (pdev->domain == pci_get_hardware_domain(seg, bus) ||
                     pdev->domain == dom_io));
 
-#ifndef CONFIG_ARM
-    /*TODO :Implement MSI support for ARM  */
+#ifdef CONFIG_HAS_PCI_MSI
     if ( pdev->msix )
     {
         rc = pci_reset_msix_state(pdev);
@@ -1494,6 +1495,9 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
             break;
         rc = hd->platform_ops->assign_device(d, devfn, pci_to_dev(pdev), flag);
     }
+
+    if ( rc )
+        goto done;
 
     rc = vpci_assign_device(d, pdev);
 
@@ -1559,10 +1563,7 @@ void iommu_dev_iotlb_flush_timeout(struct domain *d, struct pci_dev *pdev)
 {
     pcidevs_lock();
 
-#ifndef CONFIG_ARM
-    /*TODO ARM: Implement the ATS enable/disable */
     disable_ats_device(pdev);
-#endif
 
     ASSERT(pdev->domain);
     if ( d != pdev->domain )
@@ -1725,7 +1726,7 @@ int iommu_do_pci_domctl(
  * but in case of ARM this might not be the case: those may also
  * live in driver domains or even Xen itself.
  */
-bool pci_is_hardware_domain(struct domain *d, u16 seg, u8 bus)
+bool pci_is_hardware_domain(const struct domain *d, u16 seg, u8 bus)
 {
 #ifdef CONFIG_X86
     return is_hardware_domain(d);

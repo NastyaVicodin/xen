@@ -1218,9 +1218,6 @@ static int __init map_range_to_domain(const struct dt_device_node *dev,
     bool need_mapping = !dt_device_for_passthrough(dev);
     int res;
 
-    if ( need_mapping && (device_get_class(dev) == DEVICE_PCI) )
-        need_mapping = pci_host_bridge_need_mapping(d, dev, addr, len);
-
     res = iomem_permit_access(d, paddr_to_pfn(addr),
                               paddr_to_pfn(PAGE_ALIGN(addr + len - 1)));
     if ( res )
@@ -1231,6 +1228,9 @@ static int __init map_range_to_domain(const struct dt_device_node *dev,
                addr & PAGE_MASK, PAGE_ALIGN(addr + len) - 1);
         return res;
     }
+
+    if ( need_mapping && (device_get_class(dev) == DEVICE_PCI) )
+        need_mapping = pci_host_bridge_need_mapping(d, dev, addr, len);
 
     if ( need_mapping )
     {
@@ -1377,7 +1377,7 @@ static int __init handle_device(struct domain *d, struct dt_device_node *dev,
             return res;
         }
 
-        if ( dt_device_is_protected(dev) )
+        if ( device_is_protected(dt_to_dev(dev)) )
         {
             dt_dprintk("%s setup iommu\n", dt_node_full_name(dev));
             res = iommu_assign_dt_device(d, dev);
@@ -1852,7 +1852,7 @@ static int __init handle_passthrough_prop(struct kernel_info *kinfo,
         return res;
 
     /* If xen_force, we allow assignment of devices without IOMMU protection. */
-    if ( xen_force && !dt_device_is_protected(node) )
+    if ( xen_force && !device_is_protected(dt_to_dev(node)) )
         return 0;
 
     return iommu_assign_dt_device(kinfo->d, node);
@@ -2474,8 +2474,8 @@ void __init create_domUs(void)
             .arch.gic_version = XEN_DOMCTL_CONFIG_GIC_NATIVE,
             .flags = XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap,
             .max_evtchn_port = -1,
-            .max_grant_frames = 64,
-            .max_maptrack_frames = 1024,
+            .max_grant_frames = -1,
+            .max_maptrack_frames = -1,
         };
 
         if ( !dt_device_is_compatible(node, "xen,domain") )
@@ -2569,11 +2569,7 @@ int __init construct_dom0(struct domain *d)
     if ( rc < 0 )
         return rc;
 
-    rc = construct_domain(d, &kinfo);
-    if ( rc < 0 )
-        return rc;
-
-    return rc;
+    return construct_domain(d, &kinfo);
 }
 
 /*

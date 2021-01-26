@@ -239,7 +239,7 @@ struct vcpu
 
     /* IRQ-safe virq_lock protects against delivering VIRQ to stale evtchn. */
     evtchn_port_t    virq_to_evtchn[NR_VIRQS];
-    spinlock_t       virq_lock;
+    rwlock_t         virq_lock;
 
     /* Tasklet for continue_hypercall_on_cpu(). */
     struct tasklet   continue_hypercall_tasklet;
@@ -525,6 +525,15 @@ struct domain
     /* Argo interdomain communication support */
     struct argo_domain *argo;
 #endif
+
+    /*
+     * Continuation information for domain_teardown().  All fields entirely
+     * private.
+     */
+    struct {
+        unsigned int val;
+        struct vcpu *vcpu;
+    } teardown;
 };
 
 static inline struct page_list_head *page_to_list(
@@ -736,7 +745,7 @@ void sched_context_switched(struct vcpu *prev, struct vcpu *vnext);
 void continue_running(
     struct vcpu *same);
 
-void startup_cpu_idle_loop(void);
+void noreturn startup_cpu_idle_loop(void);
 extern void (*pm_idle) (void);
 extern void (*dead_idle) (void);
 

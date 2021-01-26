@@ -78,6 +78,7 @@ unsigned long __read_mostly cr4_pv32_mask;
 /* "acpi=force":  Override the disable blacklist.                   */
 /* "acpi=ht":     Limit ACPI just to boot-time to enable HT.        */
 /* "acpi=noirq":  Disables ACPI interrupt routing.                  */
+/* "acpi=verbose": Enables more verbose ACPI boot time logging.     */
 static int parse_acpi_param(const char *s);
 custom_param("acpi", parse_acpi_param);
 
@@ -216,9 +217,6 @@ static char __initdata acpi_param[10] = "";
 
 static int __init parse_acpi_param(const char *s)
 {
-    /* Save the parameter so it can be propagated to domain0. */
-    safe_strcpy(acpi_param, s);
-
     /* Interpret the parameter for use within Xen. */
     if ( !parse_bool(s, NULL) )
     {
@@ -240,8 +238,16 @@ static int __init parse_acpi_param(const char *s)
     {
         acpi_noirq_set();
     }
+    else if ( !strcmp(s, "verbose") )
+    {
+        opt_acpi_verbose = true;
+        return 0;
+    }
     else
         return -EINVAL;
+
+    /* Save the parameter so it can be propagated to domain0. */
+    safe_strcpy(acpi_param, s);
 
     return 0;
 }
@@ -619,7 +625,7 @@ static inline bool using_2M_mapping(void)
            !l1_table_offset((unsigned long)__2M_rwdata_end);
 }
 
-static void noinline init_done(void)
+static void noreturn init_done(void)
 {
     void *va;
     unsigned long start, end;
@@ -676,7 +682,7 @@ static void __init noreturn reinit_bsp_stack(void)
         asm volatile ("setssbsy" ::: "memory");
     }
 
-    reset_stack_and_jump_nolp(init_done);
+    reset_stack_and_jump(init_done);
 }
 
 /*
@@ -1058,28 +1064,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
             bytes += map->size + 4;
         }
-    }
-    else if ( bootsym(lowmem_kb) )
-    {
-        memmap_type = "Xen-e801";
-        e820_raw.map[0].addr = 0;
-        e820_raw.map[0].size = bootsym(lowmem_kb) << 10;
-        e820_raw.map[0].type = E820_RAM;
-        e820_raw.map[1].addr = 0x100000;
-        e820_raw.map[1].size = bootsym(highmem_kb) << 10;
-        e820_raw.map[1].type = E820_RAM;
-        e820_raw.nr_map = 2;
-    }
-    else if ( mbi->flags & MBI_MEMLIMITS )
-    {
-        memmap_type = "Multiboot-e801";
-        e820_raw.map[0].addr = 0;
-        e820_raw.map[0].size = mbi->mem_lower << 10;
-        e820_raw.map[0].type = E820_RAM;
-        e820_raw.map[1].addr = 0x100000;
-        e820_raw.map[1].size = mbi->mem_upper << 10;
-        e820_raw.map[1].type = E820_RAM;
-        e820_raw.nr_map = 2;
     }
     else
         panic("Bootloader provided no memory information\n");

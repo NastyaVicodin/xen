@@ -682,6 +682,13 @@ static int vpci_msi_update(const struct pci_dev *pdev, uint32_t data,
 
     ASSERT(pcidevs_locked());
 
+    if ( (address & MSI_ADDR_BASE_MASK) != MSI_ADDR_HEADER )
+    {
+        gdprintk(XENLOG_ERR, "%pp: PIRQ %u: unsupported address %lx\n",
+                 &pdev->sbdf, pirq, address);
+        return -EOPNOTSUPP;
+    }
+
     for ( i = 0; i < vectors; i++ )
     {
         uint8_t vector = MASK_EXTR(data, MSI_DATA_VECTOR_MASK);
@@ -840,8 +847,8 @@ void vpci_msi_arch_print(const struct vpci_msi *msi)
 void vpci_msix_arch_mask_entry(struct vpci_msix_entry *entry,
                                const struct pci_dev *pdev, bool mask)
 {
-    ASSERT(entry->arch.pirq != INVALID_PIRQ);
-    vpci_mask_pirq(pdev->domain, entry->arch.pirq, mask);
+    if ( entry->arch.pirq != INVALID_PIRQ )
+        vpci_mask_pirq(pdev->domain, entry->arch.pirq, mask);
 }
 
 int vpci_msix_arch_enable_entry(struct vpci_msix_entry *entry,

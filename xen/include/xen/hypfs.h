@@ -35,10 +35,12 @@ struct hypfs_entry;
  * "/a/b/c" findentry() will be called for "/", "/a", and "/a/b").
  */
 struct hypfs_funcs {
+    const struct hypfs_entry *(*enter)(const struct hypfs_entry *entry);
+    void (*exit)(const struct hypfs_entry *entry);
     int (*read)(const struct hypfs_entry *entry,
                 XEN_GUEST_HANDLE_PARAM(void) uaddr);
     int (*write)(struct hypfs_entry_leaf *leaf,
-                 XEN_GUEST_HANDLE_PARAM(void) uaddr, unsigned int ulen);
+                 XEN_GUEST_HANDLE_PARAM(const_void) uaddr, unsigned int ulen);
     unsigned int (*getsize)(const struct hypfs_entry *entry);
     struct hypfs_entry *(*findentry)(const struct hypfs_entry_dir *dir,
                                      const char *name, unsigned int name_len);
@@ -56,6 +58,7 @@ struct hypfs_entry {
     unsigned int size;
     unsigned int max_size;
     const char *name;
+    struct hypfs_entry *parent;
     struct list_head list;
     const struct hypfs_funcs *funcs;
 };
@@ -73,7 +76,18 @@ struct hypfs_entry_dir {
     struct list_head dirlist;
 };
 
-#define HYPFS_DIR_INIT(var, nam)                  \
+struct hypfs_dyndir_id {
+    struct hypfs_entry_dir dir;             /* Modified copy of template. */
+    struct hypfs_funcs funcs;               /* Dynamic functions. */
+    const struct hypfs_entry_dir *template; /* Template used. */
+#define HYPFS_DYNDIR_ID_NAMELEN 12
+    char name[HYPFS_DYNDIR_ID_NAMELEN];     /* Name of hypfs entry. */
+
+    unsigned int id;                        /* Numerical id. */
+    void *data;                             /* Data associated with id. */
+};
+
+#define HYPFS_DIR_INIT_FUNC(var, nam, fn)         \
     struct hypfs_entry_dir __read_mostly var = {  \
         .e.type = XEN_HYPFS_TYPE_DIR,             \
         .e.encoding = XEN_HYPFS_ENC_PLAIN,        \
@@ -81,22 +95,25 @@ struct hypfs_entry_dir {
         .e.size = 0,                              \
         .e.max_size = 0,                          \
         .e.list = LIST_HEAD_INIT(var.e.list),     \
-        .e.funcs = &hypfs_dir_funcs,              \
+        .e.funcs = (fn),                          \
         .dirlist = LIST_HEAD_INIT(var.dirlist),   \
     }
 
-#define HYPFS_VARSIZE_INIT(var, typ, nam, msz)    \
-    struct hypfs_entry_leaf __read_mostly var = { \
-        .e.type = (typ),                          \
-        .e.encoding = XEN_HYPFS_ENC_PLAIN,        \
-        .e.name = (nam),                          \
-        .e.max_size = (msz),                      \
-        .e.funcs = &hypfs_leaf_ro_funcs,          \
+#define HYPFS_DIR_INIT(var, nam)                  \
+    HYPFS_DIR_INIT_FUNC(var, nam, &hypfs_dir_funcs)
+
+#define HYPFS_VARSIZE_INIT(var, typ, nam, msz, fn) \
+    struct hypfs_entry_leaf __read_mostly var = {  \
+        .e.type = (typ),                           \
+        .e.encoding = XEN_HYPFS_ENC_PLAIN,         \
+        .e.name = (nam),                           \
+        .e.max_size = (msz),                       \
+        .e.funcs = (fn),                           \
     }
 
 /* Content and size need to be set via hypfs_string_set_reference(). */
 #define HYPFS_STRING_INIT(var, nam)               \
-    HYPFS_VARSIZE_INIT(var, XEN_HYPFS_TYPE_STRING, nam, 0)
+    HYPFS_VARSIZE_INIT(var, XEN_HYPFS_TYPE_STRING, nam, 0, &hypfs_leaf_ro_funcs)
 
 /*
  * Set content and size of a XEN_HYPFS_TYPE_STRING node. The node will point
@@ -147,20 +164,28 @@ extern struct hypfs_entry_dir hypfs_root;
 
 int hypfs_add_dir(struct hypfs_entry_dir *parent,
                   struct hypfs_entry_dir *dir, bool nofault);
+void hypfs_add_dyndir(struct hypfs_entry_dir *parent,
+                      struct hypfs_entry_dir *template);
 int hypfs_add_leaf(struct hypfs_entry_dir *parent,
                    struct hypfs_entry_leaf *leaf, bool nofault);
+const struct hypfs_entry *hypfs_node_enter(const struct hypfs_entry *entry);
+void hypfs_node_exit(const struct hypfs_entry *entry);
 int hypfs_read_dir(const struct hypfs_entry *entry,
                    XEN_GUEST_HANDLE_PARAM(void) uaddr);
 int hypfs_read_leaf(const struct hypfs_entry *entry,
                     XEN_GUEST_HANDLE_PARAM(void) uaddr);
 int hypfs_write_deny(struct hypfs_entry_leaf *leaf,
-                     XEN_GUEST_HANDLE_PARAM(void) uaddr, unsigned int ulen);
+                     XEN_GUEST_HANDLE_PARAM(const_void) uaddr,
+                     unsigned int ulen);
 int hypfs_write_leaf(struct hypfs_entry_leaf *leaf,
-                     XEN_GUEST_HANDLE_PARAM(void) uaddr, unsigned int ulen);
+                     XEN_GUEST_HANDLE_PARAM(const_void) uaddr,
+                     unsigned int ulen);
 int hypfs_write_bool(struct hypfs_entry_leaf *leaf,
-                     XEN_GUEST_HANDLE_PARAM(void) uaddr, unsigned int ulen);
+                     XEN_GUEST_HANDLE_PARAM(const_void) uaddr,
+                     unsigned int ulen);
 int hypfs_write_custom(struct hypfs_entry_leaf *leaf,
-                       XEN_GUEST_HANDLE_PARAM(void) uaddr, unsigned int ulen);
+                       XEN_GUEST_HANDLE_PARAM(const_void) uaddr,
+                       unsigned int ulen);
 unsigned int hypfs_getsize(const struct hypfs_entry *entry);
 struct hypfs_entry *hypfs_leaf_findentry(const struct hypfs_entry_dir *dir,
                                          const char *name,
@@ -168,6 +193,17 @@ struct hypfs_entry *hypfs_leaf_findentry(const struct hypfs_entry_dir *dir,
 struct hypfs_entry *hypfs_dir_findentry(const struct hypfs_entry_dir *dir,
                                         const char *name,
                                         unsigned int name_len);
+void *hypfs_alloc_dyndata(unsigned long size);
+#define hypfs_alloc_dyndata(type) ((type *)hypfs_alloc_dyndata(sizeof(type)))
+void *hypfs_get_dyndata(void);
+void hypfs_free_dyndata(void);
+int hypfs_read_dyndir_id_entry(const struct hypfs_entry_dir *template,
+                               unsigned int id, bool is_last,
+                               XEN_GUEST_HANDLE_PARAM(void) *uaddr);
+struct hypfs_entry *hypfs_gen_dyndir_id_entry(
+    const struct hypfs_entry_dir *template, unsigned int id, void *data);
+unsigned int hypfs_dynid_entry_size(const struct hypfs_entry *template,
+                                    unsigned int id);
 #endif
 
 #endif /* __XEN_HYPFS_H__ */

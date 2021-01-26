@@ -59,8 +59,20 @@ extern bool ipmmu_is_mmu_tlb_disable_needed(struct dt_device_node *np);
 #define dev_name(dev) dt_node_full_name(dev_to_dt(dev))
 
 /* Device logger functions */
+#ifndef CONFIG_HAS_PCI
 #define dev_print(dev, lvl, fmt, ...)    \
     printk(lvl "ipmmu: %s: " fmt, dev_name(dev), ## __VA_ARGS__)
+#else
+#define dev_print(dev, lvl, fmt, ...) ({                                \
+    if ( !dev_is_pci((dev)) )                                           \
+        printk(lvl "ipmmu: %s: " fmt, dev_name((dev)), ## __VA_ARGS__); \
+    else                                                                \
+    {                                                                   \
+        struct pci_dev *pdev = dev_to_pci((dev));                       \
+        printk(lvl "ipmmu: %pp: " fmt, &pdev->sbdf, ## __VA_ARGS__);    \
+    }                                                                   \
+})
+#endif
 
 #define dev_info(dev, fmt, ...)    \
     dev_print(dev, XENLOG_INFO, fmt, ## __VA_ARGS__)
@@ -121,6 +133,7 @@ struct ipmmu_vmsa_device {
     spinlock_t lock;    /* Protects ctx and domains[] */
     DECLARE_BITMAP(ctx, IPMMU_CTX_MAX);
     struct ipmmu_vmsa_domain *domains[IPMMU_CTX_MAX];
+    unsigned int utlb_refcount[IPMMU_UTLB_MAX];
 
     /* To show whether we have to disable IPMMU TLB cache function */
     bool is_mmu_tlb_disabled;
@@ -194,7 +207,7 @@ static DEFINE_SPINLOCK(ipmmu_devices_lock);
 #define IMCAAR               0x0004
 
 #define IMTTBCR                        0x0008
-#define IMTTBCR_EAE                    (1 << 31)
+#define IMTTBCR_EAE                    (1U << 31)
 #define IMTTBCR_PMB                    (1 << 30)
 #define IMTTBCR_SH1_NON_SHAREABLE      (0 << 28)
 #define IMTTBCR_SH1_OUTER_SHAREABLE    (2 << 28)
@@ -258,7 +271,7 @@ static DEFINE_SPINLOCK(ipmmu_devices_lock);
 #define IMUCTR(n)              ((n) < 32 ? IMUCTR0(n) : IMUCTR32(n))
 #define IMUCTR0(n)             (0x0300 + ((n) * 16))
 #define IMUCTR32(n)            (0x0600 + (((n) - 32) * 16))
-#define IMUCTR_FIXADDEN        (1 << 31)
+#define IMUCTR_FIXADDEN        (1U << 31)
 #define IMUCTR_FIXADD_MASK     (0xff << 16)
 #define IMUCTR_FIXADD_SHIFT    16
 #define IMUCTR_TTSEL_MMU(n)    ((n) << 4)
@@ -475,13 +488,12 @@ static int ipmmu_utlb_enable(struct ipmmu_vmsa_domain *domain,
         }
     }
 
-    /*
-     * TODO: Reference-count the micro-TLB as several bus masters can be
-     * connected to the same micro-TLB.
-     */
-    ipmmu_write(mmu, IMUASID(utlb), 0);
-    ipmmu_write(mmu, IMUCTR(utlb), imuctr |
-                IMUCTR_TTSEL_MMU(domain->context_id) | IMUCTR_MMUEN);
+    if ( mmu->utlb_refcount[utlb]++ == 0 )
+    {
+        ipmmu_write(mmu, IMUASID(utlb), 0);
+        ipmmu_write(mmu, IMUCTR(utlb), imuctr |
+                    IMUCTR_TTSEL_MMU(domain->context_id) | IMUCTR_MMUEN);
+    }
 
     return 0;
 }
@@ -492,7 +504,8 @@ static void ipmmu_utlb_disable(struct ipmmu_vmsa_domain *domain,
 {
     struct ipmmu_vmsa_device *mmu = domain->mmu;
 
-    ipmmu_write(mmu, IMUCTR(utlb), 0);
+    if ( --mmu->utlb_refcount[utlb] == 0 )
+       ipmmu_write(mmu, IMUCTR(utlb), 0);
 }
 
 /* Domain/Context Management */
@@ -733,8 +746,8 @@ static void ipmmu_detach_device(struct ipmmu_vmsa_domain *domain,
         ipmmu_utlb_disable(domain, fwspec->ids[i]);
 }
 
-static int ipmmu_init_platform_device(struct device *dev,
-                                      const struct dt_phandle_args *args)
+static int ipmmu_init_device(struct device *dev,
+                             const struct dt_phandle_args *args)
 {
     struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
     struct ipmmu_vmsa_device *mmu;
@@ -1072,34 +1085,6 @@ static void ipmmu_free_root_domain(struct ipmmu_vmsa_domain *domain)
     xfree(domain);
 }
 
-static int ipmmu_check_assign_pci_device(struct device *dev)
-{
-    struct device *root_dev;
-
-    root_dev = pci_find_host_bridge_device(dev);
-    if ( !root_dev )
-        return -ENODEV;
-    if ( !to_domain(root_dev) )
-        dev_err(root_dev, "Host bridge hasn't been added to IPMMU yet\n");
-    return 0;
-}
-
-static int reassign_device(struct domain *source, struct domain *target,
-                           u8 devfn, struct pci_dev *pdev)
-{
-    if ( devfn == pdev->devfn )
-    {
-        list_move(&pdev->domain_list, &target->pdev_list);
-        pdev->domain = target;
-    }
-
-    printk(XENLOG_INFO "Re-assign %04x:%02x:%02x.%u from dom%d to dom%d\n",
-           pdev->seg, pdev->bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
-           source->domain_id, target->domain_id);
-
-    return 0;
-}
-
 static int ipmmu_assign_device(struct domain *d, u8 devfn, struct device *dev,
                                uint32_t flag)
 {
@@ -1110,18 +1095,33 @@ static int ipmmu_assign_device(struct domain *d, u8 devfn, struct device *dev,
     if ( !xen_domain )
         return -EINVAL;
 
+    if ( !to_ipmmu(dev) )
+        return -ENODEV;
+
+#ifdef CONFIG_HAS_PCI
     if ( dev_is_pci(dev) )
     {
         struct pci_dev *pdev = dev_to_pci(dev);
 
-        ret = ipmmu_check_assign_pci_device(dev);
-        if ( ret )
-            return ret;
-        return reassign_device(pdev->domain, d, devfn, pdev);
-    }
+        printk(XENLOG_INFO "Assigning device %04x:%02x:%02x.%u to dom%d\n",
+               pdev->seg, pdev->bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+               d->domain_id);
 
-    if ( !to_ipmmu(dev) )
-        return -ENODEV;
+        /*
+         * XXX What would be the proper behavior? This could happen if
+         * pdev->phantom_stride > 0
+         */
+        if ( devfn != pdev->devfn )
+            ASSERT_UNREACHABLE();
+
+        list_move(&pdev->domain_list, &d->pdev_list);
+        pdev->domain = d;
+
+        /* dom_io is used as a sentinel for quarantined devices */
+        if ( d == dom_io )
+            return 0;
+    }
+#endif
 
     spin_lock(&xen_domain->lock);
 
@@ -1194,16 +1194,35 @@ out:
     return ret;
 }
 
-static int ipmmu_deassign_device(struct domain *d, struct device *dev)
+static int ipmmu_deassign_device(struct domain *d, u8 devfn, struct device *dev)
 {
     struct ipmmu_vmsa_xen_domain *xen_domain = dom_iommu(d)->arch.priv;
     struct ipmmu_vmsa_domain *domain = to_domain(dev);
 
+#ifdef CONFIG_HAS_PCI
+    if ( dev_is_pci(dev) )
+    {
+        struct pci_dev *pdev = dev_to_pci(dev);
+
+        printk(XENLOG_INFO "Deassigning device %04x:%02x:%02x.%u from dom%d\n",
+               pdev->seg, pdev->bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+               d->domain_id);
+
+        /*
+         * XXX What would be the proper behavior? This could happen if
+         * pdev->phantom_stride > 0
+         */
+        if ( devfn != pdev->devfn )
+            ASSERT_UNREACHABLE();
+
+        /* dom_io is used as a sentinel for quarantined devices */
+        if ( d == dom_io )
+            return 0;
+    }
+#endif
+
     if ( !domain || domain->d != d )
     {
-        /* PCI devices are behind the PCI bridge, so nothing to do. */
-        if ( dev_is_pci(dev) )
-            return 0;
         dev_err(dev, "Not attached to %pd\n", d);
         return -ESRCH;
     }
@@ -1238,7 +1257,7 @@ static int ipmmu_reassign_device(struct domain *s, struct domain *t,
     if ( t == s )
         return 0;
 
-    ret = ipmmu_deassign_device(s, dev);
+    ret = ipmmu_deassign_device(s, devfn, dev);
     if ( ret )
         return ret;
 
@@ -1259,9 +1278,10 @@ static int ipmmu_dt_xlate(struct device *dev,
     int ret;
 
     /*
-     * Perform sanity check of passed DT IOMMU specifier. Each master device
-     * gets micro-TLB (device ID) assignment via the "iommus" property
-     * in DT. We expect #iommu-cells to be 1 (Multiple-master IOMMU) and
+     * Perform sanity check of passed DT IOMMU specifier. Each device gets
+     * micro-TLB (device ID) assignment either via the "iommus" property
+     * (platform device) or via the "iommu-map" property (PCI device) in DT.
+     * We expect #iommu-cells to be 1 (Multiple-master IOMMU) and
      * this cell for the micro-TLB (device ID).
      */
     if ( spec->args_count != 1 || spec->args[0] >= IPMMU_UTLB_MAX )
@@ -1275,48 +1295,39 @@ static int ipmmu_dt_xlate(struct device *dev,
     if ( to_ipmmu(dev) )
         return 0;
 
-    return ipmmu_init_platform_device(dev, spec);
-}
-
-static int ipmmu_check_add_pci_device(struct device *dev)
-{
-    struct device *root_dev;
-
-    root_dev = pci_find_host_bridge_device(dev);
-    if ( !root_dev )
-        return -ENODEV;
-
-    if ( !dt_device_is_protected(dev_to_dt(root_dev)) )
-        dev_err(root_dev, "Host bridge hasn't been added to IPMMU yet\n");
-
-    return 0;
+    return ipmmu_init_device(dev, spec);
 }
 
 static int ipmmu_add_device(u8 devfn, struct device *dev)
 {
     struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
 
-    if ( dev_is_pci(dev) )
-        return ipmmu_check_add_pci_device(dev);
-
     /* Only let through devices that have been verified in xlate(). */
     if ( !to_ipmmu(dev) )
         return -ENODEV;
 
-    if ( dt_device_is_protected(dev_to_dt(dev)) )
+    if ( device_is_protected(dev) )
     {
         dev_err(dev, "Already added to IPMMU\n");
         return -EEXIST;
     }
 
     /* Let Xen know that the master device is protected by an IOMMU. */
-    dt_device_set_protected(dev_to_dt(dev));
+    device_set_protected(dev);
 
     dev_info(dev, "Added master device (IPMMU %s micro-TLBs %u)\n",
              dev_name(fwspec->iommu_dev), fwspec->num_ids);
 
     return 0;
 }
+
+#ifdef CONFIG_HAS_PCI
+static int ipmmu_remove_device(u8 devfn, struct device *dev)
+{
+    /* XXX Implement me */
+    ASSERT_UNREACHABLE();
+}
+#endif
 
 static int ipmmu_iommu_domain_init(struct domain *d)
 {
@@ -1390,6 +1401,9 @@ static const struct iommu_ops ipmmu_iommu_ops =
     .unmap_page      = arm_iommu_unmap_page,
     .dt_xlate        = ipmmu_dt_xlate,
     .add_device      = ipmmu_add_device,
+#ifdef CONFIG_HAS_PCI
+    .remove_device   = ipmmu_remove_device,
+#endif
 };
 
 static const struct dt_device_match ipmmu_dt_match[] __initconst =

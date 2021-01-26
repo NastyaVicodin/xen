@@ -111,7 +111,7 @@ int xlu_disk_parse(XLU_Config *cfg, int nspecs, const char *const *specs,
 /*
  * PCI BDF
  */
-int xlu_pci_parse_bdf(XLU_Config *cfg, libxl_pci_bdf *bdf, const char *str);
+int xlu_pci_parse_bdf(XLU_Config *cfg, libxl_device_pci *pci, const char *str);
 
 /*
  * PCI specification parsing

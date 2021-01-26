@@ -274,7 +274,7 @@ struct p2m_domain {
     void               (*memory_type_changed)(struct p2m_domain *p2m);
     void               (*write_p2m_entry_pre)(struct domain *d,
                                               unsigned long gfn,
-                                              l1_pgentry_t *p,
+                                              l1_pgentry_t old,
                                               l1_pgentry_t new,
                                               unsigned int level);
     void               (*write_p2m_entry_post)(struct p2m_domain *p2m,
@@ -660,10 +660,6 @@ int clear_mmio_p2m_entry(struct domain *d, unsigned long gfn, mfn_t mfn,
 int set_identity_p2m_entry(struct domain *d, unsigned long gfn,
                            p2m_access_t p2ma, unsigned int flag);
 int clear_identity_p2m_entry(struct domain *d, unsigned long gfn);
-
-/* Add foreign mapping to the guest's p2m table. */
-int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
-                    unsigned long gpfn, domid_t foreign_domid);
 
 /* 
  * Populate-on-demand

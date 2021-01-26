@@ -349,10 +349,7 @@ static long evtchn_bind_interdomain(evtchn_bind_interdomain_t *bind)
     domid_t        rdom = bind->remote_dom;
     long           rc;
 
-    if ( rdom == DOMID_SELF )
-        rdom = current->domain->domain_id;
-
-    if ( (rd = rcu_lock_domain_by_id(rdom)) == NULL )
+    if ( (rd = rcu_lock_domain_by_any_id(rdom)) == NULL )
         return -ESRCH;
 
     /* Avoid deadlock by first acquiring lock of domain with smaller id. */
@@ -470,6 +467,13 @@ int evtchn_bind_virq(evtchn_bind_virq_t *bind, evtchn_port_t port)
     evtchn_write_unlock(chn);
 
     bind->port = port;
+    /*
+     * If by any, the update of virq_to_evtchn[] would need guarding by
+     * virq_lock, but since this is the last action here, there's no strict
+     * need to acquire the lock. Hence holding event_lock isn't helpful
+     * anymore at this point, but utilize that its unlocking acts as the
+     * otherwise necessary smp_wmb() here.
+     */
     write_atomic(&v->virq_to_evtchn[virq], port);
 
  out:
@@ -602,7 +606,6 @@ static long evtchn_bind_pirq(evtchn_bind_pirq_t *bind)
 int evtchn_close(struct domain *d1, int port1, bool guest)
 {
     struct domain *d2 = NULL;
-    struct vcpu   *v;
     struct evtchn *chn1, *chn2;
     int            port2;
     long           rc = 0;
@@ -653,15 +656,19 @@ int evtchn_close(struct domain *d1, int port1, bool guest)
         break;
     }
 
-    case ECS_VIRQ:
-        for_each_vcpu ( d1, v )
-        {
-            if ( read_atomic(&v->virq_to_evtchn[chn1->u.virq]) != port1 )
-                continue;
-            write_atomic(&v->virq_to_evtchn[chn1->u.virq], 0);
-            spin_barrier(&v->virq_lock);
-        }
+    case ECS_VIRQ: {
+        struct vcpu *v;
+        unsigned long flags;
+
+        v = d1->vcpu[virq_is_global(chn1->u.virq) ? 0 : chn1->notify_vcpu_id];
+
+        write_lock_irqsave(&v->virq_lock, flags);
+        ASSERT(read_atomic(&v->virq_to_evtchn[chn1->u.virq]) == port1);
+        write_atomic(&v->virq_to_evtchn[chn1->u.virq], 0);
+        write_unlock_irqrestore(&v->virq_lock, flags);
+
         break;
+    }
 
     case ECS_IPI:
         break;
@@ -769,9 +776,18 @@ int evtchn_send(struct domain *ld, unsigned int lport)
         rport = lchn->u.interdomain.remote_port;
         rchn  = evtchn_from_port(rd, rport);
         if ( consumer_is_xen(rchn) )
-            xen_notification_fn(rchn)(rd->vcpu[rchn->notify_vcpu_id], rport);
-        else
-            evtchn_port_set_pending(rd, rchn->notify_vcpu_id, rchn);
+        {
+            /* Don't keep holding the lock for the call below. */
+            xen_event_channel_notification_t fn = xen_notification_fn(rchn);
+            struct vcpu *rv = rd->vcpu[rchn->notify_vcpu_id];
+
+            rcu_lock_domain(rd);
+            evtchn_read_unlock(lchn);
+            fn(rv, rport);
+            rcu_unlock_domain(rd);
+            return 0;
+        }
+        evtchn_port_set_pending(rd, rchn->notify_vcpu_id, rchn);
         break;
     case ECS_IPI:
         evtchn_port_set_pending(ld, lchn->notify_vcpu_id, lchn);
@@ -809,7 +825,7 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
 
     ASSERT(!virq_is_global(virq));
 
-    spin_lock_irqsave(&v->virq_lock, flags);
+    read_lock_irqsave(&v->virq_lock, flags);
 
     port = read_atomic(&v->virq_to_evtchn[virq]);
     if ( unlikely(port == 0) )
@@ -824,7 +840,7 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
     }
 
  out:
-    spin_unlock_irqrestore(&v->virq_lock, flags);
+    read_unlock_irqrestore(&v->virq_lock, flags);
 }
 
 void send_guest_global_virq(struct domain *d, uint32_t virq)
@@ -843,7 +859,7 @@ void send_guest_global_virq(struct domain *d, uint32_t virq)
     if ( unlikely(v == NULL) )
         return;
 
-    spin_lock_irqsave(&v->virq_lock, flags);
+    read_lock_irqsave(&v->virq_lock, flags);
 
     port = read_atomic(&v->virq_to_evtchn[virq]);
     if ( unlikely(port == 0) )
@@ -857,7 +873,7 @@ void send_guest_global_virq(struct domain *d, uint32_t virq)
     }
 
  out:
-    spin_unlock_irqrestore(&v->virq_lock, flags);
+    read_unlock_irqrestore(&v->virq_lock, flags);
 }
 
 void send_guest_pirq(struct domain *d, const struct pirq *pirq)

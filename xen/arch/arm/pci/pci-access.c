@@ -15,14 +15,63 @@
  */
 
 #include <xen/init.h>
+#include <asm/io.h>
 #include <xen/pci.h>
 #include <asm/pci.h>
-#include <xen/rwlock.h>
+
+int pci_generic_config_read(struct pci_host_bridge *bridge, uint32_t sbdf,
+                            uint32_t reg, uint32_t len, uint32_t *value)
+{
+    void __iomem *addr = bridge->ops->map_bus(bridge, sbdf, reg);
+    if (!addr) {
+        *value = ~0;
+        return -ENODEV;
+    }
+
+    switch (len) {
+    case 1:
+        *value = readb(addr);
+        break;
+    case 2:
+        *value = readw(addr);
+        break;
+    case 4:
+        *value = readl(addr);
+        break;
+    default:
+        BUG();
+    }
+
+    return 0;
+}
+
+int pci_generic_config_write(struct pci_host_bridge *bridge, uint32_t sbdf,
+                            uint32_t reg, uint32_t len, uint32_t value)
+{
+    void __iomem *addr = bridge->ops->map_bus(bridge, sbdf, reg);
+    if (!addr)
+        return -ENODEV;
+
+    switch (len) {
+    case 1:
+        writeb(value, addr);
+        break;
+    case 2:
+        writew(value, addr);
+        break;
+    case 4:
+        writel(value, addr);
+        break;
+    default:
+        BUG();
+    }
+
+    return 0;
+}
 
 static uint32_t pci_config_read(pci_sbdf_t sbdf, unsigned int reg,
-                            unsigned int len)
+                                unsigned int len)
 {
-    int rc;
     uint32_t val = GENMASK(0, len * 8);
 
     struct pci_host_bridge *bridge = pci_find_host_bridge(sbdf.seg, sbdf.bus);
@@ -37,18 +86,14 @@ static uint32_t pci_config_read(pci_sbdf_t sbdf, unsigned int reg,
     if ( unlikely(!bridge->ops->read) )
         return val;
 
-    rc = bridge->ops->read(bridge, (uint32_t) sbdf.sbdf, reg, len, &val);
-    if ( rc )
-        printk(XENLOG_ERR "Failed to read reg %#x len %u for "PRI_pci"\n",
-                reg, len, sbdf.seg, sbdf.bus, sbdf.dev, sbdf.fn);
+    bridge->ops->read(bridge, (uint32_t) sbdf.sbdf, reg, len, &val);
 
     return val;
 }
 
 static void pci_config_write(pci_sbdf_t sbdf, unsigned int reg,
-        unsigned int len, uint32_t val)
+                             unsigned int len, uint32_t val)
 {
-    int rc;
     struct pci_host_bridge *bridge = pci_find_host_bridge(sbdf.seg, sbdf.bus);
 
     if ( unlikely(!bridge) )
@@ -61,10 +106,7 @@ static void pci_config_write(pci_sbdf_t sbdf, unsigned int reg,
     if ( unlikely(!bridge->ops->write) )
         return;
 
-    rc = bridge->ops->write(bridge, (uint32_t) sbdf.sbdf, reg, len, val);
-    if ( rc )
-        printk(XENLOG_ERR "Failed to write reg %#x len %u for "PRI_pci"\n",
-                reg, len, sbdf.seg, sbdf.bus, sbdf.dev, sbdf.fn);
+    bridge->ops->write(bridge, (uint32_t) sbdf.sbdf, reg, len, val);
 }
 
 /*

@@ -243,7 +243,7 @@ static int rcar_pcie_config_access(struct pci_host_bridge *bridge,
 }
 
 int pci_rcar_gen3_config_read(struct pci_host_bridge *bridge, uint32_t _sbdf,
-                              int where, int size, u32 *val)
+                              uint32_t where, uint32_t size, u32 *val)
 {
     pci_sbdf_t sbdf;
     int ret;
@@ -271,7 +271,7 @@ int pci_rcar_gen3_config_read(struct pci_host_bridge *bridge, uint32_t _sbdf,
 }
 
 int pci_rcar_gen3_config_write(struct pci_host_bridge *bridge, uint32_t _sbdf,
-                               int where, int size, uint32_t val)
+                               uint32_t where, uint32_t size, uint32_t val)
 {
     pci_sbdf_t sbdf;
     int shift, ret;

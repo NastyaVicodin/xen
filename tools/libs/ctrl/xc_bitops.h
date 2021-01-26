@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Needed by several includees, but no longer used for bitops. */
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
-#define ORDER_LONG (sizeof(unsigned long) == 4 ? 5 : 6)
 
 #define BITMAP_ENTRY(_nr,_bmap) ((_bmap))[(_nr) / 8]
 #define BITMAP_SHIFT(_nr) ((_nr) % 8)
@@ -21,7 +19,10 @@ static inline unsigned long bitmap_size(unsigned long nr_bits)
 
 static inline void *bitmap_alloc(unsigned long nr_bits)
 {
-    return calloc(1, bitmap_size(nr_bits));
+    unsigned long longs;
+
+    longs = (nr_bits + BITS_PER_LONG - 1) / BITS_PER_LONG;
+    return calloc(longs, sizeof(unsigned long));
 }
 
 static inline void bitmap_set(void *addr, unsigned long nr_bits)

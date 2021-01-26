@@ -11,8 +11,7 @@
 #define XLU__PCI_ERR(_c, _x, _a...) \
     if((_c) && (_c)->report) fprintf((_c)->report, _x, ##_a)
 
-static int parse_bdf(libxl_pci_bdf *bdfp, uint32_t *vfunc_maskp,
-                     const char *str, const char **endp)
+static int parse_bdf(libxl_device_pci *pci, const char *str, const char **endp)
 {
     const char *ptr = str;
     unsigned int colons = 0;
@@ -46,9 +45,7 @@ static int parse_bdf(libxl_pci_bdf *bdfp, uint32_t *vfunc_maskp,
 
     ptr += n;
     if (*ptr == '*') {
-        if (!vfunc_maskp)
-            return ERROR_INVAL;
-        *vfunc_maskp = LIBXL_PCI_FUNC_ALL;
+        pci->vfunc_mask = LIBXL_PCI_FUNC_ALL;
         func = 0;
         ptr++;
     } else {
@@ -56,15 +53,14 @@ static int parse_bdf(libxl_pci_bdf *bdfp, uint32_t *vfunc_maskp,
             return ERROR_INVAL;
         if (func > 7)
             return ERROR_INVAL;
-        if (vfunc_maskp)
-            *vfunc_maskp = 1;
+        pci->vfunc_mask = 1;
         ptr += n;
     }
 
-    bdfp->domain = domain;
-    bdfp->bus = bus;
-    bdfp->dev = dev;
-    bdfp->func = func;
+    pci->domain = domain;
+    pci->bus = bus;
+    pci->dev = dev;
+    pci->func = func;
 
     if (endp)
         *endp = ptr;
@@ -141,12 +137,12 @@ static int parse_rdm_policy(XLU_Config *cfg, libxl_rdm_reserve_policy *policy,
     return ret;
 }
 
-int xlu_pci_parse_bdf(XLU_Config *cfg, libxl_pci_bdf *bdf, const char *str)
+int xlu_pci_parse_bdf(XLU_Config *cfg, libxl_device_pci *pci, const char *str)
 {
-    return parse_bdf(bdf, NULL, str, NULL);
+    return parse_bdf(pci, str, NULL);
 }
 
-int xlu_pci_parse_spec_string(XLU_Config *cfg, libxl_device_pci *pcidev,
+int xlu_pci_parse_spec_string(XLU_Config *cfg, libxl_device_pci *pci,
                               const char *str)
 {
     const char *ptr = str;
@@ -155,13 +151,13 @@ int xlu_pci_parse_spec_string(XLU_Config *cfg, libxl_device_pci *pcidev,
     int ret;
 
     /* Attempt to parse 'bdf' as positional parameter */
-    ret = parse_bdf(&pcidev->bdf, &pcidev->vfunc_mask, ptr, &ptr);
+    ret = parse_bdf(pci, ptr, &ptr);
     if (!ret) {
         bdf_present = true;
 
         /* Check whether 'vslot' if present */
         if (*ptr == '@') {
-            ret = parse_vslot(&pcidev->vdevfn, ++ptr, &ptr);
+            ret = parse_vslot(&pci->vdevfn, ++ptr, &ptr);
             if (ret)
                 return ret;
         }
@@ -180,24 +176,24 @@ int xlu_pci_parse_spec_string(XLU_Config *cfg, libxl_device_pci *pcidev,
             return ret;
 
         if (!strcmp(key, "bdf")) {
-            ret = parse_bdf(&pcidev->bdf, &pcidev->vfunc_mask, val, NULL);
-            bdf_present = !ret;
+            ret = parse_bdf(pci, val, NULL);
+            if (!ret) bdf_present = true;
         } else if (!strcmp(key, "vslot")) {
-            ret = parse_vslot(&pcidev->vdevfn, val, NULL);
+            ret = parse_vslot(&pci->vdevfn, val, NULL);
         } else if (!strcmp(key, "permissive")) {
-            pcidev->permissive = atoi(val);
+            pci->permissive = atoi(val);
         } else if (!strcmp(key, "msitranslate")) {
-            pcidev->msitranslate = atoi(val);
+            pci->msitranslate = atoi(val);
         } else if (!strcmp(key, "seize")) {
-            pcidev->seize= atoi(val);
+            pci->seize= atoi(val);
         } else if (!strcmp(key, "power_mgmt")) {
-            pcidev->power_mgmt = atoi(val);
+            pci->power_mgmt = atoi(val);
         } else if (!strcmp(key, "rdm_policy")) {
-            ret = parse_rdm_policy(cfg, &pcidev->rdm_policy, val);
+            ret = parse_rdm_policy(cfg, &pci->rdm_policy, val);
         } else if (!strcmp(key, "name")) {
             name_present = true;
-            pcidev->name = strdup(val);
-            if (!pcidev->name) ret = ERROR_NOMEM;
+            pci->name = strdup(val);
+            if (!pci->name) ret = ERROR_NOMEM;
         } else {
             XLU__PCI_ERR(cfg, "Unknown PCI_SPEC_STRING option: %s", key);
             ret = ERROR_INVAL;

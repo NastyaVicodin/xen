@@ -63,7 +63,7 @@
 #include <asm/monitor.h>
 #include <asm/xstate.h>
 
-void svm_asm_do_resume(void);
+void noreturn svm_asm_do_resume(void);
 
 u32 svm_feature_flags;
 
@@ -991,8 +991,9 @@ static void svm_ctxt_switch_to(struct vcpu *v)
         wrmsr_tsc_aux(v->arch.msrs->tsc_aux);
 }
 
-static void noreturn svm_do_resume(struct vcpu *v)
+static void noreturn svm_do_resume(void)
 {
+    struct vcpu *v = current;
     struct vmcb_struct *vmcb = v->arch.hvm.svm.vmcb;
     bool debug_state = (v->domain->debugger_attached ||
                         v->domain->arch.monitor.software_breakpoint_enabled ||
@@ -1036,7 +1037,7 @@ static void noreturn svm_do_resume(struct vcpu *v)
 
     hvm_do_resume(v);
 
-    reset_stack_and_jump_nolp(svm_asm_do_resume);
+    reset_stack_and_jump(svm_asm_do_resume);
 }
 
 void svm_vmenter_helper(const struct cpu_user_regs *regs)
@@ -1585,7 +1586,7 @@ static int _svm_cpu_up(bool bsp)
 
     /* Check whether SVM feature is disabled in BIOS */
     rdmsrl(MSR_K8_VM_CR, msr_content);
-    if ( msr_content & K8_VMCR_SVME_DISABLE )
+    if ( msr_content & VM_CR_SVM_DISABLE )
     {
         printk("CPU%d: AMD SVM Extension is disabled in BIOS.\n", cpu);
         return -EINVAL;

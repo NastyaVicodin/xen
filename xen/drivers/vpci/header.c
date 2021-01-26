@@ -104,11 +104,11 @@ static void modify_decoding(const struct pci_dev *pdev, uint16_t cmd,
      * FIXME: punching holes after the p2m has been set up might be racy for
      * DomU usage, needs to be revisited.
      */
-#ifdef CONFIG_X86
+#ifdef CONFIG_HAS_PCI_MSI
     if ( map && !rom_only && vpci_make_msix_hole(pdev) )
         return;
-
 #endif
+
     for ( i = 0; i < ARRAY_SIZE(header->bars); i++ )
     {
         if ( !MAPPABLE_BAR(&header->bars[i]) )
@@ -248,7 +248,7 @@ static int modify_bars(const struct pci_dev *pdev, uint16_t cmd, bool rom_only)
 {
     struct vpci_header *header = &pdev->vpci->header;
     struct pci_dev *tmp, *dev = NULL;
-#ifdef CONFIG_X86
+#ifdef CONFIG_HAS_PCI_MSI
     const struct vpci_msix *msix = pdev->vpci->msix;
     unsigned int j;
 #endif
@@ -294,7 +294,7 @@ static int modify_bars(const struct pci_dev *pdev, uint16_t cmd, bool rom_only)
         }
     }
 
-#ifdef CONFIG_X86
+#ifdef CONFIG_HAS_PCI_MSI
     /* Remove any MSIX regions if present. */
     for ( i = 0; msix && i < ARRAY_SIZE(msix->tables); i++ )
     {
@@ -319,7 +319,7 @@ static int modify_bars(const struct pci_dev *pdev, uint16_t cmd, bool rom_only)
             }
         }
     }
-#endif
+#endif /* CONFIG_HAS_PCI_MSI */
 
     /*
      * Check for overlaps with other BARs. Note that only BARs that are
@@ -395,7 +395,10 @@ static int modify_bars(const struct pci_dev *pdev, uint16_t cmd, bool rom_only)
             num_mem_ranges++;
     }
 
-    defer_map(dev->domain, dev, cmd, rom_only, num_mem_ranges);
+    if ( !num_mem_ranges )
+        pci_conf_write16(pdev->sbdf, PCI_COMMAND, cmd);
+    else
+        defer_map(dev->domain, dev, cmd, rom_only, num_mem_ranges);
 
     return 0;
 
@@ -660,8 +663,7 @@ static int add_bar_handlers(struct pci_dev *pdev, bool is_hwdom)
             if ( rc )
                 return rc;
         }
-        /* Make guest's view of the BAR equal to physical one at start. */
-        bars[i].guest_addr = bars[i].addr;
+        bars[i].guest_addr = 0;
     }
     return 0;
 }
@@ -765,7 +767,7 @@ static int init_bars(struct pci_dev *pdev)
 }
 REGISTER_VPCI_INIT(init_bars, VPCI_PRIORITY_MIDDLE);
 
-int vpci_bar_add_handlers(struct domain *d, struct pci_dev *pdev)
+int vpci_bar_add_handlers(const struct domain *d, struct pci_dev *pdev)
 {
     int rc;
 
@@ -785,10 +787,20 @@ int vpci_bar_add_handlers(struct domain *d, struct pci_dev *pdev)
         gprintk(XENLOG_ERR,
             "%pp: failed to add BAR handlers for dom%d\n", &pdev->sbdf,
             d->domain_id);
+
+    /*
+     * Reset the command register: it is possible that when passing
+     * through a PCI device its memory decoding bits in the command
+     * register are already set. Thus, a guest OS may not write to the
+     * command register to update memory decoding, so guest mappings
+     * (guest's view of the BARs) are left not updated.
+     */
+    pci_conf_write16(pdev->sbdf, PCI_COMMAND, 0);
+
     return rc;
 }
 
-int vpci_bar_remove_handlers(struct domain *d, struct pci_dev *pdev)
+int vpci_bar_remove_handlers(const struct domain *d, struct pci_dev *pdev)
 {
     /* Remove previously added registers. */
     vpci_remove_device_registers(pdev);

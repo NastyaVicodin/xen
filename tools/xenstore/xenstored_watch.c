@@ -47,13 +47,11 @@ struct watch
 	char *node;
 };
 
-static bool check_event_node(const char *node)
+static bool check_special_event(const char *name)
 {
-	if (!node || !strstarts(node, "@")) {
-		errno = EINVAL;
-		return false;
-	}
-	return true;
+	assert(name);
+
+	return strstarts(name, "@");
 }
 
 /* Is child a subnode of parent, or equal? */
@@ -74,12 +72,25 @@ static bool is_child(const char *child, const char *parent)
 	return child[len] == '/' || child[len] == '\0';
 }
 
+static const char *get_watch_path(const struct watch *watch, const char *name)
+{
+	const char *path = name;
+
+	if (watch->relative_path) {
+		path += strlen(watch->relative_path);
+		if (*path == '/') /* Could be "" */
+			path++;
+	}
+
+	return path;
+}
+
 /*
  * Send a watch event.
  * Temporary memory allocations are done with ctx.
  */
 static void add_event(struct connection *conn,
-		      void *ctx,
+		      const void *ctx,
 		      struct watch *watch,
 		      const char *name)
 {
@@ -87,29 +98,13 @@ static void add_event(struct connection *conn,
 	unsigned int len;
 	char *data;
 
-	if (!check_event_node(name)) {
-		/* Can this conn load node, or see that it doesn't exist? */
-		struct node *node = get_node(conn, ctx, name, XS_PERM_READ);
-		/*
-		 * XXX We allow EACCES here because otherwise a non-dom0
-		 * backend driver cannot watch for disappearance of a frontend
-		 * xenstore directory. When the directory disappears, we
-		 * revert to permissions of the parent directory for that path,
-		 * which will typically disallow access for the backend.
-		 * But this breaks device-channel teardown!
-		 * Really we should fix this better...
-		 */
-		if (!node && errno != ENOENT && errno != EACCES)
-			return;
-	}
-
-	if (watch->relative_path) {
-		name += strlen(watch->relative_path);
-		if (*name == '/') /* Could be "" */
-			name++;
-	}
+	name = get_watch_path(watch, name);
 
 	len = strlen(name) + 1 + strlen(watch->token) + 1;
+	/* Don't try to send over-long events. */
+	if (len > XENSTORE_PAYLOAD_MAX)
+		return;
+
 	data = talloc_array(ctx, char, len);
 	if (!data)
 		return;
@@ -120,11 +115,59 @@ static void add_event(struct connection *conn,
 }
 
 /*
+ * Check permissions of a specific watch to fire:
+ * Either the node itself or its parent have to be readable by the connection
+ * the watch has been setup for. In case a watch event is created due to
+ * changed permissions we need to take the old permissions into account, too.
+ */
+static bool watch_permitted(struct connection *conn, const void *ctx,
+			    const char *name, struct node *node,
+			    struct node_perms *perms)
+{
+	enum xs_perm_type perm;
+	struct node *parent;
+	char *parent_name;
+
+	if (perms) {
+		perm = perm_for_conn(conn, perms);
+		if (perm & XS_PERM_READ)
+			return true;
+	}
+
+	if (!node) {
+		node = read_node(conn, ctx, name);
+		if (!node)
+			return false;
+	}
+
+	perm = perm_for_conn(conn, &node->perms);
+	if (perm & XS_PERM_READ)
+		return true;
+
+	parent = node->parent;
+	if (!parent) {
+		parent_name = get_parent(ctx, node->name);
+		if (!parent_name)
+			return false;
+		parent = read_node(conn, ctx, parent_name);
+		if (!parent)
+			return false;
+	}
+
+	perm = perm_for_conn(conn, &parent->perms);
+
+	return perm & XS_PERM_READ;
+}
+
+/*
  * Check whether any watch events are to be sent.
  * Temporary memory allocations are done with ctx.
+ * We need to take the (potential) old permissions of the node into account
+ * as a watcher losing permissions to access a node should receive the
+ * watch event, too.
  */
-void fire_watches(struct connection *conn, void *ctx, const char *name,
-		  bool recurse)
+void fire_watches(struct connection *conn, const void *ctx, const char *name,
+		  struct node *node, bool exact, struct node_perms *perms)
 {
 	struct connection *i;
 	struct watch *watch;
@@ -135,11 +178,23 @@ void fire_watches(struct connection *conn, void *ctx, const char *name,
 
 	/* Create an event for each watch. */
 	list_for_each_entry(i, &connections, list) {
+		/* introduce/release domain watches */
+		if (check_special_event(name)) {
+			if (!check_perms_special(name, i))
+				continue;
+		} else {
+			if (!watch_permitted(i, ctx, name, node, perms))
+				continue;
+		}
+
 		list_for_each_entry(watch, &i->watches, list) {
-			if (is_child(name, watch->node))
-				add_event(i, ctx, watch, name);
-			else if (recurse && is_child(watch->node, name))
-				add_event(i, ctx, watch, watch->node);
+			if (exact) {
+				if (streq(name, watch->node))
+					add_event(i, ctx, watch, name);
+			} else {
+				if (is_child(name, watch->node))
+					add_event(i, ctx, watch, name);
+			}
 		}
 	}
 }
@@ -148,6 +203,62 @@ static int destroy_watch(void *_watch)
 {
 	trace_destroy(_watch, "watch");
 	return 0;
+}
+
+static int check_watch_path(struct connection *conn, const void *ctx,
+			    char **path, bool *relative)
+{
+	/* Check if valid event. */
+	if (strstarts(*path, "@")) {
+		*relative = false;
+		if (strlen(*path) > XENSTORE_REL_PATH_MAX)
+			goto inval;
+	} else {
+		*relative = !strstarts(*path, "/");
+		*path = canonicalize(conn, ctx, *path);
+		if (!*path)
+			return errno;
+		if (!is_valid_nodename(*path))
+			goto inval;
+	}
+
+	return 0;
+
+ inval:
+	errno = EINVAL;
+	return errno;
+}
+
+static struct watch *add_watch(struct connection *conn, char *path, char *token,
+			       bool relative)
+{
+	struct watch *watch;
+
+	watch = talloc(conn, struct watch);
+	if (!watch)
+		goto nomem;
+	watch->node = talloc_strdup(watch, path);
+	watch->token = talloc_strdup(watch, token);
+	if (!watch->node || !watch->token)
+		goto nomem;
+
+	if (relative)
+		watch->relative_path = get_implicit_path(conn);
+	else
+		watch->relative_path = NULL;
+
+	INIT_LIST_HEAD(&watch->events);
+
+	domain_watch_inc(conn);
+	list_add_tail(&watch->list, &conn->watches);
+	talloc_set_destructor(watch, destroy_watch);
+
+	return watch;
+
+ nomem:
+	talloc_free(watch);
+	errno = ENOMEM;
+	return NULL;
 }
 
 int do_watch(struct connection *conn, struct buffered_data *in)
@@ -159,19 +270,9 @@ int do_watch(struct connection *conn, struct buffered_data *in)
 	if (get_strings(in, vec, ARRAY_SIZE(vec)) != ARRAY_SIZE(vec))
 		return EINVAL;
 
-	if (strstarts(vec[0], "@")) {
-		relative = false;
-		if (strlen(vec[0]) > XENSTORE_REL_PATH_MAX)
-			return EINVAL;
-		/* check if valid event */
-	} else {
-		relative = !strstarts(vec[0], "/");
-		vec[0] = canonicalize(conn, in, vec[0]);
-		if (!vec[0])
-			return ENOMEM;
-		if (!is_valid_nodename(vec[0]))
-			return EINVAL;
-	}
+	errno = check_watch_path(conn, in, &(vec[0]), &relative);
+	if (errno)
+		return errno;
 
 	/* Check for duplicates. */
 	list_for_each_entry(watch, &conn->watches, list) {
@@ -183,26 +284,11 @@ int do_watch(struct connection *conn, struct buffered_data *in)
 	if (domain_watch(conn) > quota_nb_watch_per_domain)
 		return E2BIG;
 
-	watch = talloc(conn, struct watch);
+	watch = add_watch(conn, vec[0], vec[1], relative);
 	if (!watch)
-		return ENOMEM;
-	watch->node = talloc_strdup(watch, vec[0]);
-	watch->token = talloc_strdup(watch, vec[1]);
-	if (!watch->node || !watch->token) {
-		talloc_free(watch);
-		return ENOMEM;
-	}
-	if (relative)
-		watch->relative_path = get_implicit_path(conn);
-	else
-		watch->relative_path = NULL;
+		return errno;
 
-	INIT_LIST_HEAD(&watch->events);
-
-	domain_watch_inc(conn);
-	list_add_tail(&watch->list, &conn->watches);
 	trace_create(watch, "watch");
-	talloc_set_destructor(watch, destroy_watch);
 	send_ack(conn, XS_WATCH);
 
 	/* We fire once up front: simplifies clients and restart. */
@@ -243,6 +329,67 @@ void conn_delete_all_watches(struct connection *conn)
 		talloc_free(watch);
 		domain_watch_dec(conn);
 	}
+}
+
+const char *dump_state_watches(FILE *fp, struct connection *conn,
+			       unsigned int conn_id)
+{
+	const char *ret = NULL;
+	struct watch *watch;
+	struct xs_state_watch sw;
+	struct xs_state_record_header head;
+	const char *path;
+
+	head.type = XS_STATE_TYPE_WATCH;
+
+	list_for_each_entry(watch, &conn->watches, list) {
+		head.length = sizeof(sw);
+
+		sw.conn_id = conn_id;
+		path = get_watch_path(watch, watch->node);
+		sw.path_length = strlen(path) + 1;
+		sw.token_length = strlen(watch->token) + 1;
+		head.length += sw.path_length + sw.token_length;
+		head.length = ROUNDUP(head.length, 3);
+		if (fwrite(&head, sizeof(head), 1, fp) != 1)
+			return "Dump watch state error";
+		if (fwrite(&sw, sizeof(sw), 1, fp) != 1)
+			return "Dump watch state error";
+
+		if (fwrite(path, sw.path_length, 1, fp) != 1)
+			return "Dump watch path error";
+		if (fwrite(watch->token, sw.token_length, 1, fp) != 1)
+			return "Dump watch token error";
+
+		ret = dump_state_align(fp);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
+void read_state_watch(const void *ctx, const void *state)
+{
+	const struct xs_state_watch *sw = state;
+	struct connection *conn;
+	char *path, *token;
+	bool relative;
+
+	conn = get_connection_by_id(sw->conn_id);
+	if (!conn)
+		barf("connection not found for read watch");
+
+	path = (char *)sw->data;
+	token = path + sw->path_length;
+
+	/* Don't check success, we want the relative information only. */
+	check_watch_path(conn, ctx, &path, &relative);
+	if (!path)
+		barf("allocation error for read watch");
+
+	if (!add_watch(conn, path, token, relative))
+		barf("error adding watch");
 }
 
 /*

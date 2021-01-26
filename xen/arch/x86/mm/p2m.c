@@ -27,6 +27,7 @@
 #include <xen/mem_access.h>
 #include <xen/vm_event.h>
 #include <xen/event.h>
+#include <xen/grant_table.h>
 #include <xen/param.h>
 #include <public/vm_event.h>
 #include <asm/domain.h>
@@ -41,6 +42,10 @@
 #include <xsm/xsm.h>
 
 #include "mm-locks.h"
+
+/* Override macro from asm/page.h to make work with mfn_t */
+#undef virt_to_mfn
+#define virt_to_mfn(v) _mfn(__virt_to_mfn(v))
 
 /* Turn on/off host superpage page table support for hap, default on. */
 bool_t __initdata opt_hap_1gb = 1, __initdata opt_hap_2mb = 1;
@@ -1466,6 +1471,8 @@ int clear_identity_p2m_entry(struct domain *d, unsigned long gfn_l)
     return ret;
 }
 
+#ifdef CONFIG_MEM_SHARING
+
 /* Returns: 0 for success, -errno for failure */
 int set_shared_p2m_entry(struct domain *d, unsigned long gfn_l, mfn_t mfn)
 {
@@ -1504,7 +1511,10 @@ int set_shared_p2m_entry(struct domain *d, unsigned long gfn_l, mfn_t mfn)
     return rc;
 }
 
+#endif /* CONFIG_MEM_SHARING */
+
 #ifdef CONFIG_HVM
+
 static struct p2m_domain *
 p2m_getlru_nestedp2m(struct domain *d, struct p2m_domain *p2m)
 {
@@ -1587,9 +1597,17 @@ p2m_flush(struct vcpu *v, struct p2m_domain *p2m)
 void
 p2m_flush_nestedp2m(struct domain *d)
 {
-    int i;
+    unsigned int i;
+
     for ( i = 0; i < MAX_NESTEDP2M; i++ )
-        p2m_flush_table(d->arch.nested_p2m[i]);
+    {
+        struct p2m_domain *p2m = d->arch.nested_p2m[i];
+
+        if ( p2m_locked_by_me(p2m) )
+            p2m_flush_table_locked(p2m);
+        else
+            p2m_flush_table(p2m);
+    }
 }
 
 void np2m_flush_base(struct vcpu *v, unsigned long np2m_base)
@@ -1774,6 +1792,7 @@ unsigned long paging_gva_to_gfn(struct vcpu *v,
     if ( is_hvm_vcpu(v) && paging_mode_hap(v->domain) && nestedhvm_is_n2(v) )
     {
         unsigned long l2_gfn, l1_gfn;
+        paddr_t l1_gpa;
         struct p2m_domain *p2m;
         const struct paging_mode *mode;
         uint8_t l1_p2ma;
@@ -1788,14 +1807,16 @@ unsigned long paging_gva_to_gfn(struct vcpu *v,
         if ( l2_gfn == gfn_x(INVALID_GFN) )
             return gfn_x(INVALID_GFN);
 
-        /* translate l2 guest gfn into l1 guest gfn */
-        rv = nestedhap_walk_L1_p2m(v, l2_gfn, &l1_gfn, &l1_page_order, &l1_p2ma,
+        rv = nestedhap_walk_L1_p2m(v, pfn_to_paddr(l2_gfn), &l1_gpa,
+                                   &l1_page_order, &l1_p2ma,
                                    1,
                                    !!(*pfec & PFEC_write_access),
                                    !!(*pfec & PFEC_insn_fetch));
 
         if ( rv != NESTEDHVM_PAGEFAULT_DONE )
             return gfn_x(INVALID_GFN);
+
+        l1_gfn = paddr_to_pfn(l1_gpa);
 
         /*
          * Sanity check that l1_gfn can be used properly as a 4K mapping, even
@@ -2535,6 +2556,8 @@ out_p2m_audit:
 }
 #endif /* P2M_AUDIT */
 
+#ifdef CONFIG_HVM
+
 /*
  * Add frame from foreign domain to target domain's physmap. Similar to
  * XENMAPSPACE_gmfn but the frame is foreign being mapped into current,
@@ -2551,8 +2574,8 @@ out_p2m_audit:
  *
  * Returns: 0 ==> success
  */
-int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
-                    unsigned long gpfn, domid_t foreigndom)
+static int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
+                           unsigned long gpfn, domid_t foreigndom)
 {
     p2m_type_t p2mt, p2mt_prev;
     mfn_t prev_mfn, mfn;
@@ -2560,9 +2583,6 @@ int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
     int rc;
     struct domain *fdom;
 
-    ASSERT(tdom);
-    if ( foreigndom == DOMID_SELF )
-        return -EINVAL;
     /*
      * hvm fixme: until support is added to p2m teardown code to cleanup any
      * foreign entries, limit this to hardware domain only.
@@ -2573,13 +2593,15 @@ int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
     if ( foreigndom == DOMID_XEN )
         fdom = rcu_lock_domain(dom_xen);
     else
-        fdom = rcu_lock_domain_by_id(foreigndom);
-    if ( fdom == NULL )
-        return -ESRCH;
+    {
+        rc = rcu_lock_remote_domain_by_id(foreigndom, &fdom);
+        if ( rc )
+            return rc;
 
-    rc = -EINVAL;
-    if ( tdom == fdom )
-        goto out;
+        rc = -EINVAL;
+        if ( tdom == fdom )
+            goto out;
+    }
 
     rc = xsm_map_gmfn_foreign(XSM_TARGET, tdom, fdom);
     if ( rc )
@@ -2590,13 +2612,16 @@ int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
      *     ram_rw | ram_logdirty | ram_ro | paging_out.
      */
     page = get_page_from_gfn(fdom, fgfn, &p2mt, P2M_ALLOC);
-    if ( !page ||
-         !p2m_is_ram(p2mt) || p2m_is_shared(p2mt) || p2m_is_hole(p2mt) )
+    if ( !page )
     {
-        if ( page )
-            put_page(page);
         rc = -EINVAL;
         goto out;
+    }
+
+    if ( !p2m_is_ram(p2mt) || p2m_is_shared(p2mt) || p2m_is_hole(p2mt) )
+    {
+        rc = -EINVAL;
+        goto put_one;
     }
     mfn = page_to_mfn(page);
 
@@ -2625,8 +2650,6 @@ int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
                  gpfn, mfn_x(mfn), fgfn, tdom->domain_id, fdom->domain_id);
 
  put_both:
-    put_page(page);
-
     /*
      * This put_gfn for the above get_gfn for prev_mfn.  We must do this
      * after set_foreign_p2m_entry so another cpu doesn't populate the gpfn
@@ -2634,13 +2657,125 @@ int p2m_add_foreign(struct domain *tdom, unsigned long fgfn,
      */
     put_gfn(tdom, gpfn);
 
-out:
+ put_one:
+    put_page(page);
+
+ out:
     if ( fdom )
         rcu_unlock_domain(fdom);
+
     return rc;
 }
 
-#ifdef CONFIG_HVM
+int xenmem_add_to_physmap_one(
+    struct domain *d,
+    unsigned int space,
+    union add_to_physmap_extra extra,
+    unsigned long idx,
+    gfn_t gpfn)
+{
+    struct page_info *page = NULL;
+    unsigned long gfn = 0 /* gcc ... */, old_gpfn;
+    mfn_t prev_mfn;
+    int rc = 0;
+    mfn_t mfn = INVALID_MFN;
+    p2m_type_t p2mt;
+
+    switch ( space )
+    {
+    case XENMAPSPACE_shared_info:
+        if ( idx == 0 )
+            mfn = virt_to_mfn(d->shared_info);
+        break;
+
+    case XENMAPSPACE_grant_table:
+        rc = gnttab_map_frame(d, idx, gpfn, &mfn);
+        if ( rc )
+            return rc;
+        break;
+
+    case XENMAPSPACE_gmfn:
+    {
+        p2m_type_t p2mt;
+
+        gfn = idx;
+        mfn = get_gfn_unshare(d, gfn, &p2mt);
+        /* If the page is still shared, exit early */
+        if ( p2m_is_shared(p2mt) )
+        {
+            put_gfn(d, gfn);
+            return -ENOMEM;
+        }
+        page = get_page_from_mfn(mfn, d);
+        if ( unlikely(!page) )
+            mfn = INVALID_MFN;
+        break;
+    }
+
+    case XENMAPSPACE_gmfn_foreign:
+        return p2m_add_foreign(d, idx, gfn_x(gpfn), extra.foreign_domid);
+    }
+
+    if ( mfn_eq(mfn, INVALID_MFN) )
+    {
+        rc = -EINVAL;
+        goto put_both;
+    }
+
+    /* Remove previously mapped page if it was present. */
+    prev_mfn = get_gfn(d, gfn_x(gpfn), &p2mt);
+    if ( mfn_valid(prev_mfn) )
+    {
+        if ( is_special_page(mfn_to_page(prev_mfn)) )
+            /* Special pages are simply unhooked from this phys slot. */
+            rc = guest_physmap_remove_page(d, gpfn, prev_mfn, PAGE_ORDER_4K);
+        else if ( !mfn_eq(mfn, prev_mfn) )
+            /* Normal domain memory is freed, to avoid leaking memory. */
+            rc = guest_remove_page(d, gfn_x(gpfn));
+    }
+    /* In the XENMAPSPACE_gmfn case we still hold a ref on the old page. */
+    put_gfn(d, gfn_x(gpfn));
+
+    if ( rc )
+        goto put_both;
+
+    /* Unmap from old location, if any. */
+    old_gpfn = get_gpfn_from_mfn(mfn_x(mfn));
+    ASSERT(!SHARED_M2P(old_gpfn));
+    if ( space == XENMAPSPACE_gmfn && old_gpfn != gfn )
+    {
+        rc = -EXDEV;
+        goto put_both;
+    }
+    if ( old_gpfn != INVALID_M2P_ENTRY )
+        rc = guest_physmap_remove_page(d, _gfn(old_gpfn), mfn, PAGE_ORDER_4K);
+
+    /* Map at new location. */
+    if ( !rc )
+        rc = guest_physmap_add_page(d, gpfn, mfn, PAGE_ORDER_4K);
+
+ put_both:
+    /*
+     * In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top.
+     * We also may need to transfer ownership of the page reference to our
+     * caller.
+     */
+    if ( space == XENMAPSPACE_gmfn )
+    {
+        put_gfn(d, gfn);
+        if ( !rc && extra.ppage )
+        {
+            *extra.ppage = page;
+            page = NULL;
+        }
+    }
+
+    if ( page )
+        put_page(page);
+
+    return rc;
+}
+
 /*
  * Set/clear the #VE suppress bit for a page.  Only available on VMX.
  */
@@ -2793,7 +2928,8 @@ int p2m_set_altp2m_view_visibility(struct domain *d, unsigned int altp2m_idx,
 
     return rc;
 }
-#endif
+
+#endif /* CONFIG_HVM */
 
 /*
  * Local variables:

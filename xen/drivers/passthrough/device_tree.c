@@ -34,7 +34,7 @@ int iommu_assign_dt_device(struct domain *d, struct dt_device_node *dev)
     if ( !is_iommu_enabled(d) )
         return -EINVAL;
 
-    if ( !dt_device_is_protected(dev) )
+    if ( !device_is_protected(dt_to_dev(dev)) )
         return -EINVAL;
 
     spin_lock(&dtdevs_lock);
@@ -65,7 +65,7 @@ int iommu_deassign_dt_device(struct domain *d, struct dt_device_node *dev)
     if ( !is_iommu_enabled(d) )
         return -EINVAL;
 
-    if ( !dt_device_is_protected(dev) )
+    if ( !device_is_protected(dt_to_dev(dev)) )
         return -EINVAL;
 
     spin_lock(&dtdevs_lock);
@@ -87,7 +87,7 @@ static bool_t iommu_dt_device_is_assigned(const struct dt_device_node *dev)
 {
     bool_t assigned = 0;
 
-    if ( !dt_device_is_protected(dev) )
+    if ( !device_is_protected(dt_to_dev(dev)) )
         return 0;
 
     spin_lock(&dtdevs_lock);
@@ -127,18 +127,201 @@ int iommu_release_dt_devices(struct domain *d)
     return 0;
 }
 
+/* This correlation must not be altered */
+#define NO_IOMMU    1
+
+static int dt_iommu_xlate(struct device *dev,
+                          struct dt_phandle_args *iommu_spec)
+{
+    const struct iommu_ops *ops = iommu_get_ops();
+    int rc;
+
+    if ( !dt_device_is_available(iommu_spec->np) )
+        return NO_IOMMU;
+
+    rc = iommu_fwspec_init(dev, &iommu_spec->np->dev);
+    if ( rc )
+        return rc;
+
+    /*
+     * Provide DT IOMMU specifier which describes the IOMMU master
+     * interfaces of that device (device IDs, etc) to the driver.
+     * The driver is responsible to decide how to interpret them.
+     */
+    return ops->dt_xlate(dev, iommu_spec);
+}
+
+#ifdef CONFIG_HAS_PCI
+static int dt_map_id(struct dt_device_node *np, u32 id,
+                     const char *map_name, const char *map_mask_name,
+                     struct dt_device_node **target, u32 *id_out)
+{
+    u32 map_mask, masked_id, map_len;
+    const __be32 *map = NULL;
+
+    if ( !np || !map_name || (!target && !id_out) )
+        return -EINVAL;
+
+    map = dt_get_property(np, map_name, &map_len);
+    if ( !map )
+    {
+        if ( target )
+            return -ENODEV;
+        /* Otherwise, no map implies no translation */
+        *id_out = id;
+        return 0;
+    }
+
+    if ( !map_len || map_len % (4 * sizeof(*map)) )
+    {
+        printk(XENLOG_ERR "%pOF: Error: Bad %s length: %d\n", np,
+            map_name, map_len);
+        return -EINVAL;
+    }
+
+    /* The default is to select all bits. */
+    map_mask = 0xffffffff;
+
+    /*
+     * Can be overridden by "{iommu,msi}-map-mask" property.
+     * If of_property_read_u32() fails, the default is used.
+     */
+    if ( map_mask_name )
+        dt_property_read_u32(np, map_mask_name, &map_mask);
+
+    masked_id = map_mask & id;
+    for ( ; (int)map_len > 0; map_len -= 4 * sizeof(*map), map += 4 )
+    {
+        struct dt_device_node *phandle_node;
+        u32 id_base = be32_to_cpup(map + 0);
+        u32 phandle = be32_to_cpup(map + 1);
+        u32 out_base = be32_to_cpup(map + 2);
+        u32 id_len = be32_to_cpup(map + 3);
+
+        if ( id_base & ~map_mask )
+        {
+            printk(XENLOG_ERR "%pOF: Invalid %s translation - %s-mask (0x%x) ignores id-base (0x%x)\n",
+                   np, map_name, map_name, map_mask, id_base);
+            return -EFAULT;
+        }
+
+        if ( masked_id < id_base || masked_id >= id_base + id_len )
+            continue;
+
+        phandle_node = dt_find_node_by_phandle(phandle);
+        if ( !phandle_node )
+            return -ENODEV;
+
+        if ( target )
+        {
+            if ( !*target )
+                *target = phandle_node;
+
+            if ( *target != phandle_node )
+                continue;
+        }
+
+        if ( id_out )
+            *id_out = masked_id - id_base + out_base;
+
+        printk(XENLOG_DEBUG "%pOF: %s, using mask %08x, id-base: %08x, out-base: %08x, length: %08x, id: %08x -> %08x\n",
+               np, map_name, map_mask, id_base, out_base, id_len, id,
+               masked_id - id_base + out_base);
+        return 0;
+    }
+
+    printk(XENLOG_ERR "%pOF: no %s translation for id 0x%x on %pOF\n",
+           np, map_name, id, target && *target ? *target : NULL);
+
+    /*
+     * NOTE: Linux bypasses translation without returning an error here,
+     * but should we behave in the same way on Xen? Restrict for now.
+     */
+    return -EFAULT;
+}
+
+int iommu_add_pci_device(uint8_t devfn, struct pci_dev *pdev)
+{
+    const struct iommu_ops *ops = iommu_get_ops();
+    struct dt_phandle_args iommu_spec = { .args_count = 1 };
+    struct device *dev = pci_to_dev(pdev);
+    struct dt_device_node *np;
+    int rc = NO_IOMMU;
+
+    if ( !iommu_enabled )
+        return NO_IOMMU;
+
+    if ( !ops )
+        return -EINVAL;
+
+    if ( dev_iommu_fwspec_get(dev) )
+        return -EEXIST;
+
+    np = pci_find_host_bridge_node(dev);
+    if ( !np )
+        return -ENODEV;
+
+    /*
+     * According to the Documentation/devicetree/bindings/pci/pci-iommu.txt
+     * from Linux.
+     */
+    rc = dt_map_id(np, PCI_BDF2(pdev->bus, devfn), "iommu-map",
+                   "iommu-map-mask", &iommu_spec.np, iommu_spec.args);
+    if ( rc )
+    {
+        /*
+         * Note: There might be a case when PCIe Root port doesn't issue DMA
+         * transactions on its own, it only forwards transactions from
+         * PCIe nodes so it's RID is not covered by "iommu-map" property.
+         * So we shouldn't treat this *valid* case as an error condition,
+         * but should return NO_IOMMU (device doesn't need to be protected
+         * by an IOMMU) to the caller to decide. It won't be an issue unless
+         * we assign the Root port to the guest (call assign_device for it).
+         */
+        if ( rc == -EFAULT && pdev->type == DEV_TYPE_PCIe_BRIDGE )
+            return NO_IOMMU;
+
+        return rc == -ENODEV ? NO_IOMMU : rc;
+    }
+
+    /*
+     * The driver which supports generic PCI-IOMMU DT bindings must have
+     * these callback implemented.
+     */
+    if ( !ops->add_device || !ops->dt_xlate )
+        return -EINVAL;
+
+    rc = dt_iommu_xlate(dev, &iommu_spec);
+
+    /*
+     * Add master device to the IOMMU if latter is present and available.
+     * The driver is responsible to mark that device as protected.
+     */
+    if ( !rc )
+        rc = ops->add_device(devfn, dev);
+
+    if ( rc < 0 )
+        iommu_fwspec_free(dev);
+
+    return rc;
+}
+#endif
+
 int iommu_add_dt_device(struct dt_device_node *np)
 {
     const struct iommu_ops *ops = iommu_get_ops();
     struct dt_phandle_args iommu_spec;
     struct device *dev = dt_to_dev(np);
-    int rc = 1, index = 0;
+    int rc = NO_IOMMU, index = 0;
 
     if ( !iommu_enabled )
-        return 1;
+        return NO_IOMMU;
 
     if ( !ops )
         return -EINVAL;
+
+    if ( device_is_protected(dev) )
+        return 0;
 
     if ( dev_iommu_fwspec_get(dev) )
         return -EEXIST;
@@ -155,36 +338,9 @@ int iommu_add_dt_device(struct dt_device_node *np)
          * these callback implemented.
          */
         if ( !ops->add_device || !ops->dt_xlate )
-        {
-            /*
-             * Some Device Trees may expose both legacy SMMU and generic
-             * IOMMU bindings together. However, the SMMU driver is only
-             * supporting the former and will protect them during the
-             * initialization. So we need to skip them and not return
-             * error here.
-             *
-             * XXX: This can be dropped when the SMMU is able to deal
-             * with generic bindings.
-             */
-            if ( dt_device_is_protected(np) )
-                return 0;
-            else
-                return -EINVAL;
-        }
+            return -EINVAL;
 
-        if ( !dt_device_is_available(iommu_spec.np) )
-            break;
-
-        rc = iommu_fwspec_init(dev, &iommu_spec.np->dev);
-        if ( rc )
-            break;
-
-        /*
-         * Provide DT IOMMU specifier which describes the IOMMU master
-         * interfaces of that device (device IDs, etc) to the driver.
-         * The driver is responsible to decide how to interpret them.
-         */
-        rc = ops->dt_xlate(dev, &iommu_spec);
+        rc = dt_iommu_xlate(dev, &iommu_spec);
         if ( rc )
             break;
 

@@ -5,11 +5,13 @@
  */
 #define COMPILE_OFFSETS
 
+#ifdef CONFIG_PERF_COUNTERS
 #include <xen/perfc.h>
+#endif
 #include <xen/sched.h>
-#include <xen/bitops.h>
+#ifdef CONFIG_PV
 #include <compat/xen.h>
-#include <asm/fixmap.h>
+#endif
 #include <asm/hardirq.h>
 #include <xen/multiboot.h>
 #include <xen/multiboot2.h>
@@ -82,6 +84,7 @@ void __dummy__(void)
     DEFINE(_VGCF_syscall_disables_events,  _VGCF_syscall_disables_events);
     BLANK();
 
+#ifdef CONFIG_HVM
     OFFSET(VCPU_svm_vmcb_pa, struct vcpu, arch.hvm.svm.vmcb_pa);
     OFFSET(VCPU_svm_vmcb, struct vcpu, arch.hvm.svm.vmcb);
     BLANK();
@@ -97,11 +100,11 @@ void __dummy__(void)
     OFFSET(VCPU_nhvm_p2m, struct vcpu, arch.hvm.nvcpu.nv_p2m);
     OFFSET(VCPU_nsvm_hap_enabled, struct vcpu, arch.hvm.nvcpu.u.nsvm.ns_hap_enabled);
     BLANK();
+#endif
 
 #ifdef CONFIG_PV
     OFFSET(DOMAIN_is_32bit_pv, struct domain, arch.pv.is_32bit);
     BLANK();
-#endif
 
     OFFSET(VCPUINFO_upcall_pending, struct vcpu_info, evtchn_upcall_pending);
     OFFSET(VCPUINFO_upcall_mask, struct vcpu_info, evtchn_upcall_mask);
@@ -110,6 +113,7 @@ void __dummy__(void)
     OFFSET(COMPAT_VCPUINFO_upcall_pending, struct compat_vcpu_info, evtchn_upcall_pending);
     OFFSET(COMPAT_VCPUINFO_upcall_mask, struct compat_vcpu_info, evtchn_upcall_mask);
     BLANK();
+#endif
 
     OFFSET(CPUINFO_guest_cpu_user_regs, struct cpu_info, guest_cpu_user_regs);
     OFFSET(CPUINFO_verw_sel, struct cpu_info, verw_sel);
@@ -126,6 +130,7 @@ void __dummy__(void)
     DEFINE(CPUINFO_sizeof, sizeof(struct cpu_info));
     BLANK();
 
+#ifdef CONFIG_PV
     OFFSET(TRAPINFO_eip, struct trap_info, address);
     OFFSET(TRAPINFO_cs, struct trap_info, cs);
     OFFSET(TRAPINFO_flags, struct trap_info, flags);
@@ -137,6 +142,7 @@ void __dummy__(void)
     OFFSET(TRAPBOUNCE_cs, struct trap_bounce, cs);
     OFFSET(TRAPBOUNCE_eip, struct trap_bounce, eip);
     BLANK();
+#endif
 
     OFFSET(VCPUMSR_spec_ctrl_raw, struct vcpu_msrs, spec_ctrl.raw);
     BLANK();

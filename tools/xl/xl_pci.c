@@ -34,8 +34,7 @@ static void pcilist(uint32_t domid)
     for (i = 0; i < num; i++) {
         printf("%02x.%01x %04x:%02x:%02x.%01x\n",
                (pcis[i].vdevfn >> 3) & 0x1f, pcis[i].vdevfn & 0x7,
-               pcis[i].bdf.domain, pcis[i].bdf.bus, pcis[i].bdf.dev,
-               pcis[i].bdf.func);
+               pcis[i].domain, pcis[i].bus, pcis[i].dev, pcis[i].func);
     }
     libxl_device_pci_list_free(pcis, num);
 }
@@ -154,25 +153,22 @@ int main_pciattach(int argc, char **argv)
 
 static void pciassignable_list(bool show_names)
 {
-    libxl_pci_bdf *pcibdfs;
+    libxl_device_pci *pcis;
     int num, i;
 
-    pcibdfs = libxl_pci_bdf_assignable_list(ctx, &num);
+    pcis = libxl_device_pci_assignable_list(ctx, &num);
 
-    if ( pcibdfs == NULL )
+    if ( pcis == NULL )
         return;
     for (i = 0; i < num; i++) {
-        libxl_pci_bdf *pcibdf = &pcibdfs[i];
-        char *name = show_names ?
-            libxl_pci_bdf_assignable_bdf2name(ctx, pcibdf) : NULL;
+        libxl_device_pci *pci = &pcis[i];
+        char *name = show_names ? pci->name : NULL;
 
         printf("%04x:%02x:%02x.%01x %s\n",
-               pcibdf->domain, pcibdf->bus, pcibdf->dev, pcibdf->func,
+               pci->domain, pci->bus, pci->dev, pci->func,
                name ?: "");
-
-        free(name);
     }
-    libxl_pci_bdf_assignable_list_free(pcibdfs, num);
+    libxl_device_pci_assignable_list_free(pcis, num);
 }
 
 int main_pciassignable_list(int argc, char **argv)
@@ -196,24 +192,31 @@ int main_pciassignable_list(int argc, char **argv)
 
 static int pciassignable_add(const char *bdf, const char *name, int rebind)
 {
-    libxl_pci_bdf pcibdf;
+    libxl_device_pci pci;
     XLU_Config *config;
-    int r = 0;
+    int r;
 
-    libxl_pci_bdf_init(&pcibdf);
+    libxl_device_pci_init(&pci);
 
     config = xlu_cfg_init(stderr, "command line");
     if (!config) { perror("xlu_cfg_init"); exit(-1); }
 
-    if (xlu_pci_parse_bdf(config, &pcibdf, bdf)) {
+    if (xlu_pci_parse_bdf(config, &pci, bdf)) {
         fprintf(stderr, "pci-assignable-add: malformed BDF \"%s\"\n", bdf);
         exit(2);
     }
 
-    if (libxl_pci_bdf_assignable_add(ctx, &pcibdf, name, rebind))
-        r = 1;
+    if (name) {
+        pci.name = strdup(name);
+        if (!pci.name) {
+            fprintf(stderr, "pci-assignable-add: memory allocation failure\n");
+            exit(2);
+        }
+    }
 
-    libxl_pci_bdf_dispose(&pcibdf);
+    r = libxl_device_pci_assignable_add(ctx, &pci, rebind);
+
+    libxl_device_pci_dispose(&pci);
     xlu_cfg_destroy(config);
 
     return r;
@@ -229,7 +232,7 @@ int main_pciassignable_add(int argc, char **argv)
     };
     const char *name = NULL;
 
-    SWITCH_FOREACH_OPT(opt, "n:", opts, "pci-assignable-add", 0) {
+    SWITCH_FOREACH_OPT(opt, "n:", opts, "pci-assignable-add", 1) {
     case 'n':
         name = optarg;
         break;
@@ -245,36 +248,40 @@ int main_pciassignable_add(int argc, char **argv)
 
 static int pciassignable_remove(const char *ident, int rebind)
 {
-    libxl_pci_bdf *pcibdf;
+    libxl_device_pci pci;
     XLU_Config *config;
-    int r = 0;
+    int r;
+
+    libxl_device_pci_init(&pci);
 
     config = xlu_cfg_init(stderr, "command line");
     if (!config) { perror("xlu_cfg_init"); exit(-1); }
 
-    pcibdf = libxl_pci_bdf_assignable_name2bdf(ctx, ident);
-    if (!pcibdf) {
-        pcibdf = calloc(1, sizeof(*pcibdf));
-
-        if (!pcibdf) {
-            fprintf(stderr,
-                    "pci-assignable-remove: failed to allocate memory\n");
-            exit(2);
-        }
-
-        libxl_pci_bdf_init(pcibdf);
-        if (xlu_pci_parse_bdf(config, pcibdf, ident)) {
-            fprintf(stderr,
-                    "pci-assignable-remove: malformed BDF '%s'\n", ident);
-            exit(2);
-        }
+    /* Try remove-by-name first */
+    pci.name = strdup(ident);
+    if (!pci.name) {
+        fprintf(stderr, "pci-assignable-add: memory allocation failure\n");
+        exit(2);
     }
 
-    if (libxl_pci_bdf_assignable_remove(ctx, pcibdf, rebind))
-        r = 1;
+    r = libxl_device_pci_assignable_remove(ctx, &pci, rebind);
+    if (!r || r != ERROR_NOTFOUND)
+        goto out;
 
-    libxl_pci_bdf_dispose(pcibdf);
-    free(pcibdf);
+    /* If remove-by-name failed to find the device, try remove-by-BDF */
+    free(pci.name);
+    pci.name = NULL;
+
+    if (xlu_pci_parse_bdf(config, &pci, ident)) {
+        fprintf(stderr,
+                "pci-assignable-remove: malformed BDF '%s'\n", ident);
+        exit(2);
+    }
+
+    r = libxl_device_pci_assignable_remove(ctx, &pci, rebind);
+
+out:
+    libxl_device_pci_dispose(&pci);
     xlu_cfg_destroy(config);
 
     return r;

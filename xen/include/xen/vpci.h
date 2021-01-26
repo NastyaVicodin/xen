@@ -27,10 +27,12 @@ typedef int vpci_register_init_t(struct pci_dev *dev);
 int __must_check vpci_add_handlers(struct pci_dev *dev);
 
 /* Notify vPCI that device is assigned to guest. */
-int __must_check vpci_assign_device(struct domain *d, struct pci_dev *dev);
+int __must_check vpci_assign_device(const struct domain *d,
+                                    struct pci_dev *dev);
 
 /* Notify vPCI that device is de-assigned from guest. */
-int __must_check vpci_deassign_device(struct domain *d, struct pci_dev *dev);
+int __must_check vpci_deassign_device(const struct domain *d,
+                                      struct pci_dev *dev);
 
 /* Remove all handlers and free vpci related structures. */
 void vpci_remove_device(struct pci_dev *pdev);
@@ -64,8 +66,8 @@ uint32_t vpci_hw_read32(const struct pci_dev *pdev, unsigned int reg,
 bool __must_check vpci_process_pending(struct vcpu *v);
 
 /* Add/remove BAR handlers for a domain. */
-int vpci_bar_add_handlers(struct domain *d, struct pci_dev *pdev);
-int vpci_bar_remove_handlers(struct domain *d, struct pci_dev *pdev);
+int vpci_bar_add_handlers(const struct domain *d, struct pci_dev *pdev);
+int vpci_bar_remove_handlers(const struct domain *d, struct pci_dev *pdev);
 
 struct vpci {
     /* List of vPCI handlers for a device. */
@@ -107,7 +109,7 @@ struct vpci {
         /* FIXME: currently there's no support for SR-IOV. */
     } header;
 
-#ifdef CONFIG_X86
+#ifdef CONFIG_HAS_PCI_MSI
     /* MSI data. */
     struct vpci_msi {
       /* Address. */
@@ -153,7 +155,7 @@ struct vpci {
             struct vpci_arch_msix_entry arch;
         } entries[];
     } *msix;
-#endif
+#endif /* CONFIG_HAS_PCI_MSI */
 #endif
 };
 
@@ -165,8 +167,8 @@ struct vpci_vcpu {
     bool rom_only : 1;
 };
 
-#ifdef CONFIG_X86
 #ifdef __XEN__
+#ifdef CONFIG_HAS_PCI_MSI
 void vpci_dump_msi(void);
 
 /* Make sure there's a hole in the p2m for the MSIX mmio areas. */
@@ -228,9 +230,9 @@ static inline unsigned int vmsix_entry_nr(const struct vpci_msix *msix,
 {
     return entry - msix->entries;
 }
+#endif /* CONFIG_HAS_PCI_MSI */
 #endif /* __XEN__ */
 
-#endif
 #else /* !CONFIG_HAS_VPCI */
 struct vpci_vcpu {};
 
@@ -239,11 +241,17 @@ static inline int vpci_add_handlers(struct pci_dev *pdev)
     return 0;
 }
 
-static inline int vpci_assign_device(struct domain *d,
-                                     struct pci_dev *dev) {};
+static inline int vpci_assign_device(const struct domain *d,
+                                     struct pci_dev *dev)
+{
+    return 0;
+};
 
-static inline int vpci_deassign_device(struct domain *d,
-                                       struct pci_dev *dev) {};
+static inline int vpci_deassign_device(const struct domain *d,
+                                       struct pci_dev *dev)
+{
+    return 0;
+};
 
 static inline void vpci_dump_msi(void) { }
 

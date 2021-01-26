@@ -1,6 +1,5 @@
 obj-$(CONFIG_ARGO) += argo.o
 obj-y += bitmap.o
-obj-y += bsearch.o
 obj-$(CONFIG_HYPFS_CONFIG) += config_data.o
 obj-$(CONFIG_CORE_PARKING) += core_parking.o
 obj-y += cpu.o
@@ -21,7 +20,6 @@ obj-y += keyhandler.o
 obj-$(CONFIG_KEXEC) += kexec.o
 obj-$(CONFIG_KEXEC) += kimage.o
 obj-y += lib.o
-obj-$(CONFIG_NEEDS_LIST_SORT) += list_sort.o
 obj-$(CONFIG_LIVEPATCH) += livepatch.o livepatch_elf.o
 obj-$(CONFIG_MEM_ACCESS) += mem_access.o
 obj-y += memory.o
@@ -34,12 +32,10 @@ obj-y += preempt.o
 obj-y += random.o
 obj-y += rangeset.o
 obj-y += radix-tree.o
-obj-y += rbtree.o
 obj-y += rcupdate.o
 obj-y += rwlock.o
 obj-y += shutdown.o
 obj-y += softirq.o
-obj-y += sort.o
 obj-y += smp.o
 obj-y += spinlock.o
 obj-y += stop_machine.o
@@ -59,7 +55,7 @@ obj-bin-y += warning.init.o
 obj-$(CONFIG_XENOPROF) += xenoprof.o
 obj-y += xmalloc_tlsf.o
 
-obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma lzo unlzo unlz4 earlycpio,$(n).init.o)
+obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma lzo unlzo unlz4 unzstd earlycpio,$(n).init.o)
 
 obj-$(CONFIG_COMPAT) += $(addprefix compat/,domain.o kernel.o memory.o multicall.o xlat.o)
 
