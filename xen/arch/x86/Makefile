@@ -184,6 +184,12 @@ EFI_LDFLAGS += --major-image-version=$(XEN_VERSION)
 EFI_LDFLAGS += --minor-image-version=$(XEN_SUBVERSION)
 EFI_LDFLAGS += --major-os-version=2 --minor-os-version=0
 EFI_LDFLAGS += --major-subsystem-version=2 --minor-subsystem-version=0
+# It seems ld unfortunately can't set a custom timestamp, so add a zero value
+# for the timestamp (option --no-insert-timestamp) if SOURCE_DATE_EPOCH is
+# defined to make reproducible builds possible.
+ifdef SOURCE_DATE_EPOCH
+EFI_LDFLAGS += --no-insert-timestamp
+endif
 
 $(TARGET).efi: VIRT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A VIRT_START$$,,p')
 $(TARGET).efi: ALT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A ALT_START$$,,p')
@@ -235,7 +241,8 @@ efi/buildid.o efi/relocs-dummy.o: $(BASEDIR)/arch/x86/efi/built_in.o
 efi/buildid.o efi/relocs-dummy.o: ;
 
 asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c $(BASEDIR)/include/asm-x86/asm-macros.h
-	$(CC) $(filter-out -Wa$(comma)% -flto,$(c_flags)) -S -o $@ $<
+	$(CC) $(filter-out -Wa$(comma)% -flto,$(c_flags)) -S -g0 -o $@.new $<
+	$(call move-if-changed,$@.new,$@)
 
 asm-macros.i: CFLAGS-y += -D__ASSEMBLY__ -P
 
@@ -243,7 +250,10 @@ $(BASEDIR)/include/asm-x86/asm-macros.h: asm-macros.i Makefile
 	echo '#if 0' >$@.new
 	echo '.if 0' >>$@.new
 	echo '#endif' >>$@.new
+	echo '#ifndef __ASM_MACROS_H__' >>$@.new
+	echo '#define __ASM_MACROS_H__' >>$@.new
 	echo 'asm ( ".include \"$@\"" );' >>$@.new
+	echo '#endif /* __ASM_MACROS_H__ */' >>$@.new
 	echo '#if 0' >>$@.new
 	echo '.endif' >>$@.new
 	cat $< >>$@.new
@@ -262,7 +272,7 @@ efi/mkreloc: efi/mkreloc.c
 
 .PHONY: clean
 clean::
-	rm -f asm-offsets.s *.lds boot/*.o boot/*~ boot/core boot/mkelf32
+	rm -f asm-offsets.s *.lds *.new boot/*.o boot/*~ boot/core boot/mkelf32
 	rm -f asm-macros.i $(BASEDIR)/include/asm-x86/asm-macros.*
 	rm -f $(BASEDIR)/.xen-syms.[0-9]* boot/.*.d $(BASEDIR)/.xen.elf32
 	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.efi efi/mkreloc

@@ -323,7 +323,7 @@ void destroy_irq(unsigned int irq)
 
     if ( desc->arch.creator_domid != DOMID_INVALID )
     {
-        struct domain *d = get_domain_by_id(desc->arch.creator_domid);
+        struct domain *d = rcu_lock_domain_by_id(desc->arch.creator_domid);
 
         if ( d )
         {
@@ -334,7 +334,7 @@ void destroy_irq(unsigned int irq)
                        "Could not revoke %pd access to IRQ%u (error %d)\n",
                        d, irq, err);
 
-            put_domain(d);
+            rcu_unlock_domain(d);
         }
 
         desc->arch.creator_domid = DOMID_INVALID;
@@ -432,9 +432,14 @@ int __init init_irq_data(void)
 
     for ( irq = 0; irq < nr_irqs_gsi; irq++ )
     {
+        int rc;
+
         desc = irq_to_desc(irq);
         desc->irq = irq;
-        init_one_irq_desc(desc);
+
+        rc = init_one_irq_desc(desc);
+        if ( rc )
+            return rc;
     }
     for ( ; irq < nr_irqs; irq++ )
         irq_to_desc(irq)->irq = irq;
@@ -443,8 +448,12 @@ int __init init_irq_data(void)
         irq_max_guests = 32;
 
 #ifdef CONFIG_PV
-    /* Never allocate the hypercall vector or Linux/BSD fast-trap vector. */
+    /* Never allocate the Linux/BSD fast-trap vector. */
     set_bit(LEGACY_SYSCALL_VECTOR, used_vectors);
+#endif
+
+#ifdef CONFIG_PV32
+    /* Never allocate the hypercall vector. */
     set_bit(HYPERCALL_VECTOR, used_vectors);
 #endif
     
@@ -1340,7 +1349,7 @@ void (pirq_cleanup_check)(struct pirq *pirq, struct domain *d)
     }
 
     if ( radix_tree_delete(&d->pirq_tree, pirq->pirq) != pirq )
-        BUG_ON(!d->is_dying);
+        BUG();
 }
 
 /* Flush all ready EOIs from the top of this CPU's pending-EOI stack. */

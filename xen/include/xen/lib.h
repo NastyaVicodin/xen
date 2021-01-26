@@ -23,7 +23,13 @@
 #include <asm/bug.h>
 
 #define BUG_ON(p)  do { if (unlikely(p)) BUG();  } while (0)
-#define WARN_ON(p) do { if (unlikely(p)) WARN(); } while (0)
+#define WARN_ON(p)  ({                  \
+    bool ret_warn_on_ = (p);            \
+                                        \
+    if ( unlikely(ret_warn_on_) )       \
+        WARN();                         \
+    unlikely(ret_warn_on_);             \
+})
 
 /* All clang versions supported by Xen have _Static_assert. */
 #if defined(__clang__) || \
@@ -42,21 +48,13 @@
 #define BUILD_BUG_ON(cond) ((void)BUILD_BUG_ON_ZERO(cond))
 #endif
 
-#ifdef CONFIG_GCOV
-#define gcov_string "gcov=y"
-#else
-#define gcov_string ""
-#endif
-
 #ifndef NDEBUG
 #define ASSERT(p) \
     do { if ( unlikely(!(p)) ) assert_failed(#p); } while (0)
 #define ASSERT_UNREACHABLE() assert_failed("unreachable")
-#define debug_build() 1
 #else
 #define ASSERT(p) do { if ( 0 && (p) ) {} } while (0)
 #define ASSERT_UNREACHABLE() do { } while (0)
-#define debug_build() 0
 #endif
 
 #define ABS(_x) ({                              \

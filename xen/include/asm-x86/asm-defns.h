@@ -1,17 +1,12 @@
-/*
- * Trickery to allow this header to be included at the C level, to permit
- * proper dependency tracking in .*.o.d files, while still having it contain
- * assembler only macros.
- */
-#ifndef __ASSEMBLY__
-# if 0
-  .if 0
-# endif
-asm ( "\t.include \"asm/indirect_thunk_asm.h\"" );
-# if 0
-  .endif
-# endif
-#else
+#ifndef HAVE_AS_CLAC_STAC
+.macro clac
+    .byte 0x0f, 0x01, 0xca
+.endm
+
+.macro stac
+    .byte 0x0f, 0x01, 0xcb
+.endm
+#endif
 
 .macro INDIRECT_BRANCH insn:req arg:req
 /*
@@ -49,5 +44,3 @@ asm ( "\t.include \"asm/indirect_thunk_asm.h\"" );
 .macro INDIRECT_JMP arg:req
     INDIRECT_BRANCH jmp \arg
 .endm
-
-#endif

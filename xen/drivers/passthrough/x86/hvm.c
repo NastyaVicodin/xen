@@ -950,8 +950,7 @@ static void hvm_dirq_assist(struct domain *d, struct hvm_pirq_dpci *pirq_dpci)
     spin_unlock(&d->event_lock);
 }
 
-static void hvm_pirq_eoi(struct pirq *pirq,
-                         const union vioapic_redir_entry *ent)
+static void hvm_pirq_eoi(struct pirq *pirq)
 {
     struct hvm_pirq_dpci *pirq_dpci;
 
@@ -968,7 +967,6 @@ static void hvm_pirq_eoi(struct pirq *pirq,
      * since interrupt is still not EOIed
      */
     if ( --pirq_dpci->pending ||
-         (ent && ent->fields.mask) ||
          !pt_irq_need_timer(pirq_dpci->flags) )
         return;
 
@@ -977,19 +975,17 @@ static void hvm_pirq_eoi(struct pirq *pirq,
 }
 
 static void __hvm_dpci_eoi(struct domain *d,
-                           const struct hvm_girq_dpci_mapping *girq,
-                           const union vioapic_redir_entry *ent)
+                           const struct hvm_girq_dpci_mapping *girq)
 {
     struct pirq *pirq = pirq_info(d, girq->machine_gsi);
 
     if ( !hvm_domain_use_pirq(d, pirq) )
         hvm_pci_intx_deassert(d, girq->device, girq->intx);
 
-    hvm_pirq_eoi(pirq, ent);
+    hvm_pirq_eoi(pirq);
 }
 
-static void hvm_gsi_eoi(struct domain *d, unsigned int gsi,
-                        const union vioapic_redir_entry *ent)
+static void hvm_gsi_eoi(struct domain *d, unsigned int gsi)
 {
     struct pirq *pirq = pirq_info(d, gsi);
 
@@ -998,11 +994,10 @@ static void hvm_gsi_eoi(struct domain *d, unsigned int gsi,
         return;
 
     hvm_gsi_deassert(d, gsi);
-    hvm_pirq_eoi(pirq, ent);
+    hvm_pirq_eoi(pirq);
 }
 
-void hvm_dpci_eoi(struct domain *d, unsigned int guest_gsi,
-                  const union vioapic_redir_entry *ent)
+void hvm_dpci_eoi(struct domain *d, unsigned int guest_gsi)
 {
     const struct hvm_irq_dpci *hvm_irq_dpci;
     const struct hvm_girq_dpci_mapping *girq;
@@ -1013,7 +1008,7 @@ void hvm_dpci_eoi(struct domain *d, unsigned int guest_gsi,
     if ( is_hardware_domain(d) )
     {
         spin_lock(&d->event_lock);
-        hvm_gsi_eoi(d, guest_gsi, ent);
+        hvm_gsi_eoi(d, guest_gsi);
         goto unlock;
     }
 
@@ -1030,7 +1025,7 @@ void hvm_dpci_eoi(struct domain *d, unsigned int guest_gsi,
         goto unlock;
 
     list_for_each_entry ( girq, &hvm_irq_dpci->girq[guest_gsi], list )
-        __hvm_dpci_eoi(d, girq, ent);
+        __hvm_dpci_eoi(d, girq);
 
 unlock:
     spin_unlock(&d->event_lock);
@@ -1040,6 +1035,10 @@ static int pci_clean_dpci_irq(struct domain *d,
                               struct hvm_pirq_dpci *pirq_dpci, void *arg)
 {
     struct dev_intx_gsi_link *digl, *tmp;
+
+    if ( !pirq_dpci->flags )
+        /* Already processed. */
+        return 0;
 
     pirq_guest_unbind(d, dpci_pirq(pirq_dpci));
 
@@ -1051,15 +1050,10 @@ static int pci_clean_dpci_irq(struct domain *d,
         list_del(&digl->list);
         xfree(digl);
     }
+    /* Note the pirq is now unbound. */
+    pirq_dpci->flags = 0;
 
-    radix_tree_delete(&d->pirq_tree, dpci_pirq(pirq_dpci)->pirq);
-
-    if ( !pt_pirq_softirq_active(pirq_dpci) )
-        return 0;
-
-    domain_get_irq_dpci(d)->pending_pirq_dpci = pirq_dpci;
-
-    return -ERESTART;
+    return pt_pirq_softirq_active(pirq_dpci) ? -ERESTART : 0;
 }
 
 int arch_pci_clean_pirqs(struct domain *d)
@@ -1076,18 +1070,8 @@ int arch_pci_clean_pirqs(struct domain *d)
     hvm_irq_dpci = domain_get_irq_dpci(d);
     if ( hvm_irq_dpci != NULL )
     {
-        int ret = 0;
+        int ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
 
-        if ( hvm_irq_dpci->pending_pirq_dpci )
-        {
-            if ( pt_pirq_softirq_active(hvm_irq_dpci->pending_pirq_dpci) )
-                 ret = -ERESTART;
-            else
-                 hvm_irq_dpci->pending_pirq_dpci = NULL;
-        }
-
-        if ( !ret )
-            ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
         if ( ret )
         {
             spin_unlock(&d->event_lock);

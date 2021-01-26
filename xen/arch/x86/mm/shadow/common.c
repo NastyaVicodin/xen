@@ -2779,6 +2779,34 @@ int shadow_enable(struct domain *d, u32 mode)
     return rv;
 }
 
+void shadow_vcpu_teardown(struct vcpu *v)
+{
+    struct domain *d = v->domain;
+
+    paging_lock(d);
+
+    if ( !paging_mode_shadow(d) || !v->arch.paging.mode )
+        goto out;
+
+    v->arch.paging.mode->shadow.detach_old_tables(v);
+#ifdef CONFIG_HVM
+    if ( shadow_mode_external(d) )
+    {
+        mfn_t mfn = pagetable_get_mfn(v->arch.hvm.monitor_table);
+
+        if ( mfn_x(mfn) )
+            sh_destroy_monitor_table(
+                v, mfn,
+                v->arch.paging.mode->shadow.shadow_levels);
+
+        v->arch.hvm.monitor_table = pagetable_null();
+    }
+#endif
+
+ out:
+    paging_unlock(d);
+}
+
 void shadow_teardown(struct domain *d, bool *preempted)
 /* Destroy the shadow pagetables of this domain and free its shadow memory.
  * Should only be called for dying domains. */
@@ -2789,31 +2817,11 @@ void shadow_teardown(struct domain *d, bool *preempted)
     ASSERT(d->is_dying);
     ASSERT(d != current->domain);
 
+    /* TODO - Remove when the teardown path is better structured. */
+    for_each_vcpu ( d, v )
+        shadow_vcpu_teardown(v);
+
     paging_lock(d);
-
-    if ( shadow_mode_enabled(d) )
-    {
-        /* Release the shadow and monitor tables held by each vcpu */
-        for_each_vcpu(d, v)
-        {
-            if ( v->arch.paging.mode )
-            {
-                v->arch.paging.mode->shadow.detach_old_tables(v);
-#ifdef CONFIG_HVM
-                if ( shadow_mode_external(d) )
-                {
-                    mfn_t mfn = pagetable_get_mfn(v->arch.hvm.monitor_table);
-
-                    if ( mfn_valid(mfn) && (mfn_x(mfn) != 0) )
-                        sh_destroy_monitor_table(
-                            v, mfn,
-                            v->arch.paging.mode->shadow.shadow_levels);
-                    v->arch.hvm.monitor_table = pagetable_null();
-                }
-#endif /* CONFIG_HVM */
-            }
-        }
-    }
 
 #if (SHADOW_OPTIMIZATIONS & (SHOPT_VIRTUAL_TLB|SHOPT_OUT_OF_SYNC))
     /* Free the virtual-TLB array attached to each vcpu */
@@ -3078,80 +3086,87 @@ static int shadow_test_disable(struct domain *d)
  */
 
 static void sh_unshadow_for_p2m_change(struct domain *d, unsigned long gfn,
-                                       l1_pgentry_t *p, l1_pgentry_t new,
+                                       l1_pgentry_t old, l1_pgentry_t new,
                                        unsigned int level)
 {
-    /* The following assertion is to make sure we don't step on 1GB host
-     * page support of HVM guest. */
-    ASSERT(!(level > 2 && (l1e_get_flags(*p) & _PAGE_PRESENT) &&
-             (l1e_get_flags(*p) & _PAGE_PSE)));
+    mfn_t omfn = l1e_get_mfn(old);
+    unsigned int oflags = l1e_get_flags(old);
+    p2m_type_t p2mt = p2m_flags_to_type(oflags);
+    bool flush = false;
+
+    /*
+     * If there are any shadows, update them.  But if shadow_teardown()
+     * has already been called then it's not safe to try.
+     */
+    if ( unlikely(!d->arch.paging.shadow.total_pages) )
+        return;
+
+    switch ( level )
+    {
+    default:
+        /*
+         * The following assertion is to make sure we don't step on 1GB host
+         * page support of HVM guest.
+         */
+        ASSERT(!((oflags & _PAGE_PRESENT) && (oflags & _PAGE_PSE)));
+        break;
 
     /* If we're removing an MFN from the p2m, remove it from the shadows too */
-    if ( level == 1 )
-    {
-        mfn_t mfn = l1e_get_mfn(*p);
-        p2m_type_t p2mt = p2m_flags_to_type(l1e_get_flags(*p));
-        if ( (p2m_is_valid(p2mt) || p2m_is_grant(p2mt)) && mfn_valid(mfn) )
+    case 1:
+        if ( (p2m_is_valid(p2mt) || p2m_is_grant(p2mt)) && mfn_valid(omfn) )
         {
-            sh_remove_all_shadows_and_parents(d, mfn);
-            if ( sh_remove_all_mappings(d, mfn, _gfn(gfn)) )
-                guest_flush_tlb_mask(d, d->dirty_cpumask);
+            sh_remove_all_shadows_and_parents(d, omfn);
+            if ( sh_remove_all_mappings(d, omfn, _gfn(gfn)) )
+                flush = true;
         }
-    }
+        break;
 
-    /* If we're removing a superpage mapping from the p2m, we need to check
+    /*
+     * If we're removing a superpage mapping from the p2m, we need to check
      * all the pages covered by it.  If they're still there in the new
-     * scheme, that's OK, but otherwise they must be unshadowed. */
-    if ( level == 2 && (l1e_get_flags(*p) & _PAGE_PRESENT) &&
-         (l1e_get_flags(*p) & _PAGE_PSE) )
-    {
-        unsigned int i;
-        cpumask_t flushmask;
-        mfn_t omfn = l1e_get_mfn(*p);
-        mfn_t nmfn = l1e_get_mfn(new);
-        l1_pgentry_t *npte = NULL;
-        p2m_type_t p2mt = p2m_flags_to_type(l1e_get_flags(*p));
+     * scheme, that's OK, but otherwise they must be unshadowed.
+     */
+    case 2:
+        if ( !(oflags & _PAGE_PRESENT) || !(oflags & _PAGE_PSE) )
+            break;
+
         if ( p2m_is_valid(p2mt) && mfn_valid(omfn) )
         {
-            cpumask_clear(&flushmask);
+            unsigned int i;
+            mfn_t nmfn = l1e_get_mfn(new);
+            l1_pgentry_t *npte = NULL;
 
             /* If we're replacing a superpage with a normal L1 page, map it */
-            if ( (l1e_get_flags(new) & _PAGE_PRESENT)
-                 && !(l1e_get_flags(new) & _PAGE_PSE)
-                 && mfn_valid(nmfn) )
+            if ( (l1e_get_flags(new) & _PAGE_PRESENT) &&
+                 !(l1e_get_flags(new) & _PAGE_PSE) &&
+                 mfn_valid(nmfn) )
                 npte = map_domain_page(nmfn);
 
             gfn &= ~(L1_PAGETABLE_ENTRIES - 1);
 
             for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
             {
-                if ( !npte
-                     || !p2m_is_ram(p2m_flags_to_type(l1e_get_flags(npte[i])))
-                     || !mfn_eq(l1e_get_mfn(npte[i]), omfn) )
+                if ( !npte ||
+                     !p2m_is_ram(p2m_flags_to_type(l1e_get_flags(npte[i]))) ||
+                     !mfn_eq(l1e_get_mfn(npte[i]), omfn) )
                 {
                     /* This GFN->MFN mapping has gone away */
                     sh_remove_all_shadows_and_parents(d, omfn);
                     if ( sh_remove_all_mappings(d, omfn, _gfn(gfn + i)) )
-                        cpumask_or(&flushmask, &flushmask, d->dirty_cpumask);
+                        flush = true;
                 }
                 omfn = mfn_add(omfn, 1);
             }
-            guest_flush_tlb_mask(d, &flushmask);
 
             if ( npte )
                 unmap_domain_page(npte);
         }
-    }
-}
 
-static void
-sh_write_p2m_entry_pre(struct domain *d, unsigned long gfn, l1_pgentry_t *p,
-                       l1_pgentry_t new, unsigned int level)
-{
-    /* If there are any shadows, update them.  But if shadow_teardown()
-     * has already been called then it's not safe to try. */
-    if ( likely(d->arch.paging.shadow.total_pages != 0) )
-         sh_unshadow_for_p2m_change(d, gfn, p, new, level);
+        break;
+    }
+
+    if ( flush )
+        guest_flush_tlb_mask(d, d->dirty_cpumask);
 }
 
 #if (SHADOW_OPTIMIZATIONS & SHOPT_FAST_FAULT_PATH)
@@ -3178,7 +3193,7 @@ sh_write_p2m_entry_post(struct p2m_domain *p2m, unsigned int oflags)
 
 void shadow_p2m_init(struct p2m_domain *p2m)
 {
-    p2m->write_p2m_entry_pre  = sh_write_p2m_entry_pre;
+    p2m->write_p2m_entry_pre  = sh_unshadow_for_p2m_change;
     p2m->write_p2m_entry_post = sh_write_p2m_entry_post;
 }
 
