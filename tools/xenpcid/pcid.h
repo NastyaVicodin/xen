@@ -55,6 +55,13 @@ struct flexarray {
     libxl_ctx *ctx;
 };
 
+struct device_pci {
+    int domain;
+    int bus;
+    int dev;
+    int func;
+};
+
 struct pcid__json_map_node {
     char *map_key;
     struct pcid__json_object *obj;

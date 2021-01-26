@@ -25,12 +25,17 @@
 
 #define XENPCID_MSG_EXECUTE         "execute"
 #define XENPCID_MSG_RETURN          "return"
+#define XENPCID_MSG_ERROR           "error"
 
 #define XENPCID_MSG_FIELD_ID        "id"
 #define XENPCID_MSG_FIELD_ARGS      "arguments"
 
 #define XENPCID_CMD_LIST            "ls"
 #define XENPCID_CMD_LIST_DIR_ID     "dir_id"
+
+#define XENPCID_CMD_WRITE           "write"
+#define XENPCID_CMD_SYSFS_PATH      "sysfs_path"
+#define XENPCID_CMD_PCI_INFO        "pci_info"
 
 #define XENPCID_PCIBACK_DRIVER      "pciback_driver"
 
