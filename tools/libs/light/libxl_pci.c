@@ -245,8 +245,11 @@ static int vchan_handle_message(libxl__gc *gc,
     {
     case LIBXL__PCID_MESSAGE_TYPE_RETURN:
         *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_ARRAY);
+        if ( !(*result) )
+            *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_STRING);
         return 0;
     case LIBXL__PCID_MESSAGE_TYPE_ERROR:
+        LOGE(ERROR, "Error occured during command processing.");
         break;
     case LIBXL__PCID_MESSAGE_TYPE_INVALID:
         return ERROR_PROTOCOL_ERROR_PCID;
@@ -705,25 +708,24 @@ static bool is_pci_in_array(libxl_device_pci *pcis, int num,
 static int sysfs_write_bdf(libxl__gc *gc, const char * sysfs_path,
                            libxl_device_pci *pci)
 {
-    int rc, fd;
     char *buf;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    fd = open(sysfs_path, O_WRONLY);
-    if (fd < 0) {
-        LOGE(ERROR, "Couldn't open %s", sysfs_path);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return ERROR_FAIL;
+
+    buf = GCSPRINTF(PCI_BDF, pci->domain, pci->bus, pci->dev, pci->func);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_SYSFS_PATH, sysfs_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, buf);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_WRITE, args);
+    if ( !result )
+    {
+        LOGE(WARN, "Write to %s/%s failed\n", sysfs_path, buf);
         return ERROR_FAIL;
     }
-
-    buf = GCSPRINTF(PCI_BDF, pci->domain, pci->bus,
-                    pci->dev, pci->func);
-    rc = write(fd, buf, strlen(buf));
-    /* Annoying to have two if's, but we need the errno */
-    if (rc < 0)
-        LOGE(ERROR, "write to %s returned %d", sysfs_path, rc);
-    close(fd);
-
-    if (rc < 0)
-        return ERROR_FAIL;
 
     return 0;
 }
@@ -825,6 +827,7 @@ out:
     libxl__json_object *args = NULL;
     const libxl__json_object *result = NULL, *dir;
     int i;
+    char *name;
     const char *dir_name;
 
     *num = 0;

@@ -99,16 +99,28 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
 #endif
 
     yajl_gen_map_open(hand);
-    pcid__yajl_gen_asciiz(hand, XENPCID_MSG_RETURN);
-    yajl_gen_array_open(hand);
-    if (result && result->type == JSON_STRING && result->u.list) {
-        resp_list = result->u.list;
-        while (resp_list) {
-            pcid__yajl_gen_asciiz(hand, resp_list->val);
-            resp_list = resp_list->next;
+
+    if ( !result ) {
+        pcid__yajl_gen_asciiz(hand, XENPCID_MSG_ERROR);
+    } else {
+        pcid__yajl_gen_asciiz(hand, XENPCID_MSG_RETURN);
+        if (result->type == JSON_ARRAY) {
+            yajl_gen_array_open(hand);
+            if (result->u.list) {
+                resp_list = result->u.list;
+                while (resp_list) {
+                    pcid__yajl_gen_asciiz(hand, resp_list->val);
+                    resp_list = resp_list->next;
+                }
+            }
+            yajl_gen_array_close(hand);
+        } else if (result->type == JSON_STRING) {
+            if (result->u.string)
+                pcid__yajl_gen_asciiz(hand, result->u.string);
+            else
+                pcid__yajl_gen_asciiz(hand, "success");
         }
     }
-    yajl_gen_array_close(hand);
     pcid__yajl_gen_asciiz(hand, XENPCID_MSG_FIELD_ID);
     yajl_gen_integer(hand, id);
     yajl_gen_map_close(hand);
@@ -118,9 +130,10 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
         goto out;
     }
 
-	ret = pcid_zalloc(sizeof((int)len));
-	sprintf(ret, "%*.*s" XENPCID_END_OF_MESSAGE,
+    ret = pcid_zalloc(sizeof((int)len));
+    sprintf(ret, "%*.*s" XENPCID_END_OF_MESSAGE,
             (int)len, (int)len, buf);
+    fprintf(stderr, "ret = %s\n", ret);
 
 out:
     return ret;
@@ -178,7 +191,7 @@ static void flexarray_grow(struct flexarray *array, int extents)
     int newsize;
 
     newsize = array->size + extents;
-    array->data = realloc(array->data, newsize);
+    array->data = realloc(array->data, newsize * sizeof(*(array->data)));
     array->size += extents;
 }
 
@@ -256,6 +269,28 @@ static struct pcid__json_object *pcid__json_map_get(const char *key,
     return NULL;
 }
 
+static int handle_write_cmd(char *sysfs_path, char *pci_info)
+{
+    int rc, fd;
+
+    fd = open(sysfs_path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Couldn't open %s", sysfs_path);
+        return ERROR_FAIL;
+    }
+
+    rc = write(fd, pci_info, strlen(pci_info));
+    /* Annoying to have two if's, but we need the errno */
+    if (rc < 0)
+        fprintf(stderr, "write to %s returned %d", sysfs_path, rc);
+    close(fd);
+
+    if (rc < 0)
+        return ERROR_FAIL;
+
+    return 0;
+}
+
 static int vchan_handle_message(libxl_ctx *ctx,
                                 struct vchan_state *state,
                                 struct pcid__json_object **resp,
@@ -263,7 +298,7 @@ static int vchan_handle_message(libxl_ctx *ctx,
 {
     int ret;
     struct list_head *dir_list = NULL;
-    struct pcid__json_object *command_obj, *args, *dir_id;
+    struct pcid__json_object *command_obj, *args, *dir_id, *sysfs_path, *pci_info;
     char *dir_name, *command_name;
 
     command_obj = pcid__json_map_get(XENPCID_MSG_EXECUTE, *resp, JSON_ANY);
@@ -278,8 +313,18 @@ static int vchan_handle_message(libxl_ctx *ctx,
         if (ret)
             goto out;
 
-        (*resp)->type = JSON_STRING;
+        (*resp)->type = JSON_ARRAY;
         (*resp)->u.list = dir_list;
+    } else if (strcmp(XENPCID_CMD_WRITE, command_name) == 0) {
+        args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
+        sysfs_path = pcid__json_map_get(XENPCID_CMD_SYSFS_PATH, args, JSON_ANY);
+        pci_info = pcid__json_map_get(XENPCID_CMD_PCI_INFO, args, JSON_ANY);
+
+        ret = handle_write_cmd(sysfs_path->u.string, pci_info->u.string);
+        if (ret != 0)
+            goto out;
+        (*resp)->type = JSON_STRING;
+        (*resp)->u.string = NULL;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto out;
