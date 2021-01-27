@@ -119,6 +119,10 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
                 pcid__yajl_gen_asciiz(hand, result->u.string);
             else
                 pcid__yajl_gen_asciiz(hand, "success");
+        } else if (result->type == JSON_INTEGER) {
+            yajl_gen_integer(hand, result->u.i);
+        } else {
+            fprintf(stderr, "Unknown result type\n");
         }
     }
     pcid__yajl_gen_asciiz(hand, XENPCID_MSG_FIELD_ID);
@@ -297,16 +301,37 @@ static int handle_write_cmd(char *sysfs_path, char *pci_info)
     return 0;
 }
 
+static long long handle_read_cmd(char *sysfs_path)
+{
+    uint16_t read_items;
+    long long result;
+    FILE *f = fopen(sysfs_path, "r");
+
+    if (!f) {
+        fprintf(stderr, "PCI device %s does not have vendor attribute\n",
+                sysfs_path);
+        return -1;
+    }
+    read_items = fscanf(f, "0x%llx\n", &result);
+    fclose(f);
+    if (read_items != 1) {
+        fprintf(stderr, "Cannot read vendor of pci device %s\n", sysfs_path);
+        return -1;
+    }
+
+    return result;
+}
+
 static int vchan_handle_message(libxl_ctx *ctx,
                                 struct vchan_state *state,
                                 struct pcid__json_object **resp,
                                 struct pcid__json_object **result)
 {
-    int ret;
+    long long ret;
     struct list_head *dir_list = NULL;
     struct pcid__json_object *command_obj, *args, *dir_id, *sysfs_path, *pci_info;
     char *dir_name, *command_name;
-fprintf(stderr, "vchan_handle_message\n");
+
     command_obj = pcid__json_map_get(XENPCID_MSG_EXECUTE, *resp, JSON_ANY);
     command_name = command_obj->u.string;
 
@@ -331,6 +356,15 @@ fprintf(stderr, "vchan_handle_message\n");
             goto out;
         (*resp)->type = JSON_STRING;
         (*resp)->u.string = NULL;
+    } else if(strcmp(XENPCID_CMD_READ, command_name) == 0) {
+        args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
+        sysfs_path = pcid__json_map_get(XENPCID_CMD_SYSFS_PATH, args, JSON_ANY);
+
+        ret = handle_read_cmd(sysfs_path->u.string);
+        if (ret < 0)
+            goto out;
+        (*resp)->type = JSON_INTEGER;
+        (*resp)->u.i = ret;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto out;
