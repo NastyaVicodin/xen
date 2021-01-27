@@ -39,6 +39,7 @@
 #define XENPCID_CMD_PCI_INFO        "pci_info"
 
 #define XENPCID_PCIBACK_DRIVER      "pciback_driver"
+#define XENPCID_PCI_DEV             "pci_dev"
 
 #include <stdbool.h>
 

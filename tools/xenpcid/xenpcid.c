@@ -156,6 +156,10 @@ static int handle_ls_command(char *dir_name, struct list_head **result)
 #if defined(__linux__)
         dir = opendir(SYSFS_PCIBACK_DRIVER);
 #endif
+    } else if (strcmp(XENPCID_PCI_DEV, dir_name) == 0){
+#if defined(__linux__)
+        dir = opendir(SYSFS_PCI_DEV);
+#endif
     } else {
         fprintf(stderr, "Unknown directory: %s\n", dir_name);
         goto out;
