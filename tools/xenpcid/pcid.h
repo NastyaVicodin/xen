@@ -19,6 +19,10 @@
 #ifndef PCID_H
 #define PCID_H
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #define DOM0_ID 0
 
 #if defined(__linux__)
@@ -29,6 +33,8 @@
 #define PCI_INFO_PATH "/libxl/pci"
 #define PCI_BDF_XSPATH         "%04x-%02x-%02x-%01x"
 #define PCI_BDF                "%04x:%02x:%02x.%01x"
+
+#define PROC_PCI_NUM_RESOURCES 7
 
 enum pcid__json_node_type {
     JSON_NULL    = (1 << 0),
@@ -46,6 +52,13 @@ enum pcid__json_node_type {
 struct list_head {
     struct list_head *next, *prev;
     char *val;
+};
+
+struct list_resources {
+    struct list_resources *next, *prev;
+    long long start;
+    long long end;
+    long long flags;
 };
 
 struct flexarray {
@@ -76,6 +89,7 @@ struct pcid__json_object {
         double d;
         char *string;
         struct list_head *list;
+        struct list_resources *list_rsc;
         /* List of pcid__json_object */
         struct flexarray *array;
         /* List of pcid__json_map_node */

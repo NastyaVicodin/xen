@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -46,7 +45,7 @@ static void vchan_wr(char *reply)
 
     len = strlen(reply);
 	ret = libxenvchan_write(ctrl, reply, len);
-
+    //free(reply);
     if (ret < 0) {
         fprintf(stderr, "vchan write failed\n");
         exit(1);
@@ -86,6 +85,7 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
     yajl_gen_status s;
     char *ret = NULL;
     struct list_head *resp_list;
+    struct list_resources *resp_rsc_list;
 
     hand = libxl_yajl_gen_alloc(NULL);
     if ( !hand ) {
@@ -110,13 +110,24 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
                 resp_list = result->u.list;
                 while (resp_list) {
                     pcid__yajl_gen_asciiz(hand, resp_list->val);
+                    free(resp_list->val);
                     resp_list = resp_list->next;
+                }
+            } else if (result->u.list_rsc) {
+                resp_rsc_list = result->u.list_rsc;
+                while (resp_rsc_list) {
+                    yajl_gen_integer(hand, resp_rsc_list->start);
+                    yajl_gen_integer(hand, resp_rsc_list->end);
+                    yajl_gen_integer(hand, resp_rsc_list->flags);
+                    resp_rsc_list = resp_rsc_list->next;
                 }
             }
             yajl_gen_array_close(hand);
         } else if (result->type == JSON_STRING) {
-            if (result->u.string)
+            if (result->u.string) {
                 pcid__yajl_gen_asciiz(hand, result->u.string);
+                //free(result->u.string);
+            }
             else
                 pcid__yajl_gen_asciiz(hand, "success");
         } else if (result->type == JSON_INTEGER) {
@@ -145,7 +156,7 @@ out:
 
 static int handle_ls_command(char *dir_name, struct list_head **result)
 {
-    struct list_head *dirs = NULL, *head = NULL, *prev =NULL;
+    struct list_head *dirs = NULL, *head = NULL, *prev = NULL;
     struct dirent *de;
     DIR *dir = NULL;
 
@@ -207,7 +218,6 @@ static void flexarray_grow(struct flexarray *array, int extents)
 
 static int flexarray_set(struct flexarray *array, unsigned int idx, void *ptr)
 {
-    fprintf(stderr, "idx = %d\n", idx);
     if (idx >= array->size) {
         int newsize;
         if (!array->autogrow)
@@ -266,10 +276,7 @@ static struct pcid__json_object *pcid__json_map_get(const char *key,
             if (flexarray_get(maps, idx, (void**)&node) != 0) {
                 return NULL;
             }
-            fprintf(stderr, "key = %s\n", key);
             if (strcmp(key, node->map_key) == 0) {
-                fprintf(stderr, "expected_type = %d\n", expected_type);
-                fprintf(stderr, "node->obj->type = %d\n", node->obj->type);
                 if (expected_type == JSON_ANY
                     || (node->obj && (node->obj->type & expected_type))) {
                     return node->obj;
@@ -285,18 +292,17 @@ static struct pcid__json_object *pcid__json_map_get(const char *key,
 static int handle_write_cmd(char *sysfs_path, char *pci_info)
 {
     int rc, fd;
-    fprintf(stderr, "sysfs_path = %s\n",sysfs_path);
-    fprintf(stderr, "pci_info = %s\n",pci_info);
+
     fd = open(sysfs_path, O_WRONLY);
     if (fd < 0) {
-        fprintf(stderr, "Couldn't open %s", sysfs_path);
+        fprintf(stderr, "Couldn't open %s\n", sysfs_path);
         return ERROR_FAIL;
     }
 
     rc = write(fd, pci_info, strlen(pci_info));
     /* Annoying to have two if's, but we need the errno */
     if (rc < 0)
-        fprintf(stderr, "write to %s returned %d", sysfs_path, rc);
+        fprintf(stderr, "write to %s returned %d\n", sysfs_path, rc);
     close(fd);
 
     if (rc < 0)
@@ -326,22 +332,105 @@ static long long handle_read_cmd(char *sysfs_path)
     return result;
 }
 
+static int handle_read_resources_cmd(char *pci_path,
+                                     struct list_resources **result)
+{
+    unsigned long long start, end, flags;
+    struct list_resources *list = NULL, *head = NULL, *prev = NULL;
+    int i;
+    char *sysfs_path;
+    FILE *f;
+
+    head = (struct list_resources*)pcid_zalloc(sizeof(struct list_resources));
+    list = head;
+
+    sysfs_path = (char *)pcid_zalloc(sizeof(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1));
+    sprintf(sysfs_path, SYSFS_PCI_DEV"%s", pci_path);
+    f = fopen(sysfs_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s\n", sysfs_path);
+        return -1;
+    }
+    for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
+        if (fscanf(f, "0x%llx 0x%llx 0x%llx\n", &start, &end, &flags) != 3)
+            continue;
+
+        if (!list)
+        {
+            list = (struct list_resources*)pcid_zalloc(sizeof(struct list_resources));
+            prev->next = list;
+        }
+        list->start = start;
+        list->end = end;
+        list->flags = flags;
+        prev = list;
+        list = list->next;
+    }
+    fclose(f);
+
+    *result = head;
+
+    return 0;
+}
+
+static int handle_unbind_cmd(char *pci_path, char *pci_info, char **result)
+{
+    char *spath, *new_path, *dp;
+    struct stat st;
+
+    spath = (char *)pcid_zalloc(sizeof(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1));
+    sprintf(spath, SYSFS_PCI_DEV"%s", pci_path);
+    if ( !lstat(spath, &st) ) {
+        /* Find the canonical path to the driver. */
+        dp = (char *)pcid_zalloc(PATH_MAX);
+        if ( !(realpath("/sys/bus/pci/devices/0000:00:02.0/driver", dp)) ) {
+            fprintf(stderr, "realpath() failed\n");
+            goto fail;
+        }
+        *result = dp;
+        new_path = (char *)pcid_zalloc(sizeof(strlen(dp) + strlen("/unbind") + 1));
+        /* Unbind from the old driver */
+        sprintf(new_path, "%s/unbind", dp);
+
+        if ( handle_write_cmd(new_path, pci_info) != 0 ) {
+            fprintf(stderr, "Couldn't unbind device\n");
+            goto fail_write;
+        }
+        free(new_path);
+    } else {
+        *result = (char *)pcid_zalloc(sizeof(strlen("nolstat") + 1));
+        sprintf(*result, "nolstat");
+    }
+    free(spath);
+
+    return 0;
+
+fail_write:
+    free(new_path);
+fail:
+    free(spath);
+
+    return -1;
+}
+
 static int vchan_handle_message(libxl_ctx *ctx,
                                 struct vchan_state *state,
-                                struct pcid__json_object **resp,
-                                struct pcid__json_object **result)
+                                struct pcid__json_object **resp)
 {
-    long long ret;
+    long long read_result;
+    int ret;
     struct list_head *dir_list = NULL;
-    struct pcid__json_object *command_obj, *args, *dir_id, *sysfs_path, *pci_info;
-    char *dir_name, *command_name;
+    struct list_resources *resources_list = NULL;
+    struct pcid__json_object *command_obj, *args, *dir_id, *pci_info;
+    struct pcid__json_object *pci_path;
+    char *dir_name, *command_name, *full_path = NULL;
 
     command_obj = pcid__json_map_get(XENPCID_MSG_EXECUTE, *resp, JSON_ANY);
     command_name = command_obj->u.string;
 
     if (strcmp(XENPCID_CMD_LIST, command_name) == 0) {
         args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
-        dir_id = pcid__json_map_get(XENPCID_CMD_LIST_DIR_ID, args, JSON_ANY);
+        dir_id = pcid__json_map_get(XENPCID_CMD_DIR_ID, args, JSON_ANY);
         dir_name = dir_id->u.string;
 
         ret = handle_ls_command(dir_name, &dir_list);
@@ -352,23 +441,67 @@ static int vchan_handle_message(libxl_ctx *ctx,
         (*resp)->u.list = dir_list;
     } else if (strcmp(XENPCID_CMD_WRITE, command_name) == 0) {
         args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
-        sysfs_path = pcid__json_map_get(XENPCID_CMD_SYSFS_PATH, args, JSON_ANY);
+        dir_id = pcid__json_map_get(XENPCID_CMD_DIR_ID, args, JSON_ANY);
+        pci_path = pcid__json_map_get(XENPCID_CMD_PCI_PATH, args, JSON_ANY);
         pci_info = pcid__json_map_get(XENPCID_CMD_PCI_INFO, args, JSON_ANY);
 
-        ret = handle_write_cmd(sysfs_path->u.string, pci_info->u.string);
+        if (strcmp(dir_id->u.string, XENPCID_PCI_DEV) == 0) {
+            full_path = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) +
+                                            strlen(pci_path->u.string) + 1);
+            sprintf(full_path, SYSFS_PCI_DEV"%s", pci_path->u.string);
+        } else if (strcmp(dir_id->u.string, XENPCID_PCIBACK_DRIVER) == 0){
+            full_path = (char *)pcid_zalloc(strlen(SYSFS_PCIBACK_DRIVER) +
+                                            strlen(pci_path->u.string) + 1);
+            sprintf(full_path, SYSFS_PCIBACK_DRIVER"%s", pci_path->u.string);
+        } else if (strcmp(dir_id->u.string, SYSFS_DRIVER_PATH) == 0){
+            full_path = pci_path->u.string;
+        } else {
+            fprintf(stderr, "Unknown write directory %s\n", dir_id->u.string);
+            goto out;
+        }
+        ret = handle_write_cmd(full_path, pci_info->u.string);
+        //full_path ? free(full_path) : 0;
         if (ret != 0)
             goto out;
         (*resp)->type = JSON_STRING;
         (*resp)->u.string = NULL;
-    } else if(strcmp(XENPCID_CMD_READ, command_name) == 0) {
+    } else if (strcmp(XENPCID_CMD_READ, command_name) == 0) {
         args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
-        sysfs_path = pcid__json_map_get(XENPCID_CMD_SYSFS_PATH, args, JSON_ANY);
+        pci_info = pcid__json_map_get(XENPCID_CMD_PCI_INFO, args, JSON_ANY);
+        dir_id = pcid__json_map_get(XENPCID_CMD_DIR_ID, args, JSON_ANY);
 
-        ret = handle_read_cmd(sysfs_path->u.string);
-        if (ret < 0)
+        if (strcmp(XENPCID_PCI_DEV, dir_id->u.string) == 0) {
+            full_path = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) +
+                                            strlen(pci_info->u.string) + 1);
+            sprintf(full_path, SYSFS_PCI_DEV"%s", pci_info->u.string);
+        } else {
+            full_path = pci_info->u.string;
+        }
+        read_result = handle_read_cmd(full_path);
+        //full_path ? free(full_path) : 0;
+        if (read_result < 0)
             goto out;
         (*resp)->type = JSON_INTEGER;
-        (*resp)->u.i = ret;
+        (*resp)->u.i = read_result;
+    } else if (strcmp(XENPCID_CMD_READ_RESOURCES, command_name) == 0) {
+        args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
+        pci_info = pcid__json_map_get(XENPCID_CMD_PCI_INFO, args, JSON_ANY);
+
+        ret = handle_read_resources_cmd(pci_info->u.string, &resources_list);
+        if (ret < 0)
+            goto out;
+        (*resp)->type = JSON_ARRAY;
+        (*resp)->u.list_rsc = resources_list;
+    } else if (strcmp(XENPCID_CMD_UNBIND, command_name) == 0) {
+        args = pcid__json_map_get(XENPCID_MSG_FIELD_ARGS, *resp, JSON_MAP);
+        pci_path = pcid__json_map_get(XENPCID_CMD_PCI_PATH, args, JSON_ANY);
+        pci_info = pcid__json_map_get(XENPCID_CMD_PCI_INFO, args, JSON_ANY);
+
+        ret = handle_unbind_cmd(pci_path->u.string, pci_info->u.string, &full_path);
+        if ( ret < 0 )
+            goto out;
+        (*resp)->type = JSON_STRING;
+        (*resp)->u.string = full_path;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto out;
@@ -483,8 +616,7 @@ static int json_callback_map_key(void *opaque, const unsigned char *str,
 
         node = pcid_zalloc(sizeof(*node));
         node->map_key = t;
-        node->obj = NULL;
-        fprintf(stderr, "node->map_key = %s\n",node->map_key);
+        node->obj = NULL;;
         flexarray_append(obj->u.map, node);
     } else {
         fprintf(stderr, "Current json object is not a map\n");
@@ -648,8 +780,11 @@ static int vchan_read_message(libxl_ctx *ctx,
         return rc;
     }
 
-    rc = vchan_handle_message(ctx, state, &o, result);
-    *result = o;
+    rc = vchan_handle_message(ctx, state, &o);
+    if ( rc == 0 )
+        *result = o;
+    else
+        *result = NULL;
     return 0;
 }
 

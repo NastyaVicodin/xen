@@ -31,15 +31,19 @@
 #define XENPCID_MSG_FIELD_ARGS      "arguments"
 
 #define XENPCID_CMD_LIST            "ls"
-#define XENPCID_CMD_LIST_DIR_ID     "dir_id"
+#define XENPCID_CMD_UNBIND          "unbind"
+#define XENPCID_CMD_DIR_ID          "dir_id"
 
 #define XENPCID_CMD_WRITE           "write"
 #define XENPCID_CMD_READ            "read"
-#define XENPCID_CMD_SYSFS_PATH      "sysfs_path"
+#define XENPCID_CMD_READ_RESOURCES  "read_resources"
+#define XENPCID_CMD_PCI_PATH        "pci_path"
 #define XENPCID_CMD_PCI_INFO        "pci_info"
 
 #define XENPCID_PCIBACK_DRIVER      "pciback_driver"
 #define XENPCID_PCI_DEV             "pci_dev"
+
+#define SYSFS_DRIVER_PATH           "driver_path"
 
 #include <stdbool.h>
 
