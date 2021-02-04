@@ -35,6 +35,7 @@ static void *pcid_zalloc(size_t size)
         fprintf(stderr, "Memory allocation failed\n");
 		exit(1);
 	}
+    memset(ptr, 0, size);
 
     return ptr;
 }
@@ -45,7 +46,7 @@ static void vchan_wr(char *reply)
 
     len = strlen(reply);
 	ret = libxenvchan_write(ctrl, reply, len);
-    //free(reply);
+
     if (ret < 0) {
         fprintf(stderr, "vchan write failed\n");
         exit(1);
@@ -74,6 +75,29 @@ static yajl_gen_status pcid__yajl_gen_asciiz(yajl_gen hand, const char *str)
     return yajl_gen_string(hand, (const unsigned char *)str, strlen(str));
 }
 
+static void free_list(struct list_head *head)
+{
+    struct list_head* tmp;
+
+    while (head != NULL)
+    {
+        tmp = head;
+        head = head->next;
+        free(tmp);
+    }
+}
+
+static void free_list_rsc(struct list_resources *head)
+{
+    struct list_resources* tmp;
+
+    while (head != NULL)
+    {
+        tmp = head;
+        head = head->next;
+        free(tmp);
+    }
+}
 static char *vchan_prepare_cmd(struct pcid__json_object *result,
                                const struct pcid__json_object *args,
                                int id)
@@ -113,6 +137,7 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
                     free(resp_list->val);
                     resp_list = resp_list->next;
                 }
+                free_list(result->u.list);
             } else if (result->u.list_rsc) {
                 resp_rsc_list = result->u.list_rsc;
                 while (resp_rsc_list) {
@@ -121,14 +146,15 @@ static char *vchan_prepare_cmd(struct pcid__json_object *result,
                     yajl_gen_integer(hand, resp_rsc_list->flags);
                     resp_rsc_list = resp_rsc_list->next;
                 }
+                free_list_rsc(result->u.list_rsc);
             }
             yajl_gen_array_close(hand);
         } else if (result->type == JSON_STRING) {
             if (result->u.string) {
+                fprintf(stderr, "result->u.string = %s\n", result->u.string);
                 pcid__yajl_gen_asciiz(hand, result->u.string);
-                //free(result->u.string);
-            }
-            else
+                free(result->u.string);
+            } else
                 pcid__yajl_gen_asciiz(hand, "success");
         } else if (result->type == JSON_INTEGER) {
             yajl_gen_integer(hand, result->u.i);
@@ -289,7 +315,7 @@ static struct pcid__json_object *pcid__json_map_get(const char *key,
 static int handle_write_cmd(char *sysfs_path, char *pci_info)
 {
     int rc, fd;
-
+    fprintf(stderr, "handle_write_cmd %s\n", sysfs_path);
     fd = open(sysfs_path, O_WRONLY);
     if (fd < 0) {
         fprintf(stderr, "Couldn't open %s\n", sysfs_path);
@@ -346,6 +372,7 @@ static int handle_read_resources_cmd(char *pci_path,
     f = fopen(sysfs_path, "r");
     if (!f) {
         fprintf(stderr, "Failed to open %s\n", sysfs_path);
+        free(sysfs_path);
         return -1;
     }
     for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
@@ -364,7 +391,7 @@ static int handle_read_resources_cmd(char *pci_path,
         list = list->next;
     }
     fclose(f);
-
+    free(sysfs_path);
     *result = head;
 
     return 0;
@@ -372,20 +399,22 @@ static int handle_read_resources_cmd(char *pci_path,
 
 static int handle_unbind_cmd(char *pci_path, char *pci_info, char **result)
 {
-    char *spath, *new_path, *dp;
+    char *spath, *new_path, *dp = NULL;
     struct stat st;
 
-    spath = (char *)pcid_zalloc(sizeof(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1));
+    spath = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1);
     sprintf(spath, SYSFS_PCI_DEV"%s", pci_path);
+    free(pci_path);
+
     if ( !lstat(spath, &st) ) {
         /* Find the canonical path to the driver. */
         dp = (char *)pcid_zalloc(PATH_MAX);
-        if ( !(realpath("/sys/bus/pci/devices/0000:00:02.0/driver", dp)) ) {
+        if ( !(realpath(spath, dp)) ) {
             fprintf(stderr, "realpath() failed\n");
             goto fail;
         }
         *result = dp;
-        new_path = (char *)pcid_zalloc(sizeof(strlen(dp) + strlen("/unbind") + 1));
+        new_path = (char *)pcid_zalloc(strlen(dp) + strlen("/unbind") + 1);
         /* Unbind from the old driver */
         sprintf(new_path, "%s/unbind", dp);
 
@@ -395,10 +424,11 @@ static int handle_unbind_cmd(char *pci_path, char *pci_info, char **result)
         }
         free(new_path);
     } else {
-        *result = (char *)pcid_zalloc(sizeof(strlen("nolstat") + 1));
+        *result = (char *)pcid_zalloc(strlen("nolstat") + 1);
         sprintf(*result, "nolstat");
     }
     free(spath);
+    free(pci_info);
 
     return 0;
 
@@ -406,6 +436,7 @@ fail_write:
     free(new_path);
 fail:
     free(spath);
+    free(pci_info);
 
     return -1;
 }
@@ -457,7 +488,7 @@ static int vchan_handle_message(libxl_ctx *ctx,
             goto out;
         }
         ret = handle_write_cmd(full_path, pci_info->u.string);
-        //full_path ? free(full_path) : 0;
+        full_path ? free(full_path) : 0;
         if (ret != 0)
             goto out;
         (*resp)->type = JSON_STRING;
@@ -475,7 +506,7 @@ static int vchan_handle_message(libxl_ctx *ctx,
             full_path = pci_info->u.string;
         }
         read_result = handle_read_cmd(full_path);
-        //full_path ? free(full_path) : 0;
+        full_path ? free(full_path) : 0;
         if (read_result < 0)
             goto out;
         (*resp)->type = JSON_INTEGER;
@@ -499,11 +530,15 @@ static int vchan_handle_message(libxl_ctx *ctx,
             goto out;
         (*resp)->type = JSON_STRING;
         (*resp)->u.string = full_path;
+        free(args);
+        free(pci_path);
+        free(pci_info);
     } else {
         fprintf(stderr, "Unknown command\n");
         goto out;
     }
-
+    free(command_name);
+    fprintf(stderr, "vchan_handle_message end\n");
     return 0;
 
 out:
