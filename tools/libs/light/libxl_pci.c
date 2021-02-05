@@ -1935,38 +1935,54 @@ out:
 static int libxl__device_pci_reset(libxl__gc *gc, unsigned int domain, unsigned int bus,
                                    unsigned int dev, unsigned int func)
 {
-    char *reset;
-    int fd, rc;
+    char *reset, *buf;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    reset = GCSPRINTF("%s/do_flr", SYSFS_PCIBACK_DRIVER);
-    fd = open(reset, O_WRONLY);
-    if (fd >= 0) {
-        char *buf = GCSPRINTF(PCI_BDF, domain, bus, dev, func);
-        rc = write(fd, buf, strlen(buf));
-        if (rc < 0)
-            LOGD(ERROR, domain, "write to %s returned %d", reset, rc);
-        close(fd);
-        return rc < 0 ? rc : 0;
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return -1;
+
+    reset = GCSPRINTF("%s", "/do_flr");
+    buf = GCSPRINTF(PCI_BDF, domain, bus, dev, func);
+
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_PATH, reset);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, buf);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_WRITE, args);
+    if ( !result ) {
+        LOGD(ERROR, domain, "write to %s returned error", reset);
+        return -1;
     }
-    if (errno != ENOENT)
-        LOGED(ERROR, domain, "Failed to access pciback path %s", reset);
-    reset = GCSPRINTF("%s/"PCI_BDF"/reset", SYSFS_PCI_DEV, domain, bus, dev, func);
-    fd = open(reset, O_WRONLY);
-    if (fd >= 0) {
-        rc = write(fd, "1", 1);
-        if (rc < 0)
-            LOGED(ERROR, domain, "write to %s returned %d", reset, rc);
-        close(fd);
-        return rc < 0 ? rc : 0;
-    }
-    if (errno == ENOENT) {
-        LOGD(ERROR, domain,
-             "The kernel doesn't support reset from sysfs for PCI device "PCI_BDF,
-             domain, bus, dev, func);
-    } else {
-        LOGED(ERROR, domain, "Failed to access reset path %s", reset);
-    }
-    return -1;
+
+    // fd = open(reset, O_WRONLY);
+    // if (fd >= 0) {
+    //     char *buf = GCSPRINTF(PCI_BDF, domain, bus, dev, func);
+    //     rc = write(fd, buf, strlen(buf));
+    //     if (rc < 0)
+    //         LOGD(ERROR, domain, "write to %s returned %d", reset, rc);
+    //     close(fd);
+    //     return rc < 0 ? rc : 0;
+    // }
+    // if (errno != ENOENT)
+    //     LOGED(ERROR, domain, "Failed to access pciback path %s", reset);
+    // reset = GCSPRINTF("%s/"PCI_BDF"/reset", SYSFS_PCI_DEV, domain, bus, dev, func);
+    // fd = open(reset, O_WRONLY);
+    // if (fd >= 0) {
+    //     rc = write(fd, "1", 1);
+    //     if (rc < 0)
+    //         LOGED(ERROR, domain, "write to %s returned %d", reset, rc);
+    //     close(fd);
+    //     return rc < 0 ? rc : 0;
+    // }
+    // if (errno == ENOENT) {
+    //     LOGD(ERROR, domain,
+    //          "The kernel doesn't support reset from sysfs for PCI device "PCI_BDF,
+    //          domain, bus, dev, func);
+    // } else {
+    //     LOGED(ERROR, domain, "Failed to access reset path %s", reset);
+    // }
+    return 0;
 }
 
 int libxl__device_pci_setdefault(libxl__gc *gc, uint32_t domid,
@@ -2358,6 +2374,9 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
     libxl_device_pci *pci = &prs->pci;
     int rc, num;
     uint32_t domainid = domid;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL, *addr;
 
     pcis = libxl_device_pci_list(ctx, domid, &num);
     if (!pcis) {
@@ -2396,20 +2415,30 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
             goto out_fail;
         }
     } else {
-        char *sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/resource", pci->domain,
+        char *sysfs_path = GCSPRINTF("/"PCI_BDF"/resource", pci->domain,
                                      pci->bus, pci->dev, pci->func);
-        FILE *f = fopen(sysfs_path, "r");
         unsigned int start = 0, end = 0, flags = 0, size = 0;
         int irq = 0;
-        int i;
-
-        if (f == NULL) {
-            LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+        int i, j = 0;
+        vchan = vchan_get_instance(gc);
+        if ( !vchan )
+            goto out_fail;
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, sysfs_path);
+        result = vchan_send_command(gc, vchan, XENPCID_CMD_READ_RESOURCES, args);
+        if ( !result ) {
+            LOGED(ERROR, domainid, "Couldn't get resources from %s", sysfs_path);
+            rc = ERROR_FAIL;
             goto skip1;
         }
+
         for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
-            if (fscanf(f, "0x%x 0x%x 0x%x\n", &start, &end, &flags) != 3)
-                continue;
+            addr = libxl__json_array_get(result, j++);
+            start = libxl__json_object_get_integer(addr);
+            addr = libxl__json_array_get(result, j++);
+            end = libxl__json_object_get_integer(addr);
+            addr = libxl__json_array_get(result, j++);
+            flags = libxl__json_object_get_integer(addr);
+
             size = end - start + 1;
             if (start) {
                 if (flags & PCI_BAR_IO) {
@@ -2430,16 +2459,22 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
                 }
             }
         }
-        fclose(f);
+
 skip1:
-        sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/irq", pci->domain,
+        sysfs_path = GCSPRINTF("/"PCI_BDF"/irq", pci->domain,
                                pci->bus, pci->dev, pci->func);
-        f = fopen(sysfs_path, "r");
-        if (f == NULL) {
-            LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, sysfs_path);
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                    XENPCID_PCI_DEV);
+        result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+        if ( !result ) {
+            LOGED(ERROR, domainid, "Couldn't get irq from %s", sysfs_path);
+            rc = ERROR_FAIL;
             goto skip_irq;
         }
-        if ((fscanf(f, "%u", &irq) == 1) && irq) {
+
+        irq = libxl__json_object_get_integer(result);
+        if ( irq ) {
             rc = xc_physdev_unmap_pirq(ctx->xch, domid, irq);
             if (rc < 0) {
                 LOGED(ERROR, domainid, "xc_physdev_unmap_pirq irq=%d", irq);
@@ -2449,7 +2484,6 @@ skip1:
                 LOGED(ERROR, domainid, "xc_domain_irq_permission irq=%d", irq);
             }
         }
-        fclose(f);
     }
 skip_irq:
     rc = 0;
