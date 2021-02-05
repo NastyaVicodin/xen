@@ -2,9 +2,10 @@ XEN_ROOT=$(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
 CFLAGS += -Werror
-CFLAGS += $(CFLAGS_libxenstore) $(CFLAGS_libxenvchan) $(CFLAGS_libxengnttab) $(CFLAGS_libxenevtchn)
+CFLAGS += $(CFLAGS_libxenstore) $(CFLAGS_libxenvchan) $(CFLAGS_libxengnttab) $(CFLAGS_libxenevtchn) $(CFLAGS_libxenlight)
+CFLAGS += -include $(XEN_ROOT)/tools/config.h # libxl_json.h needs it.
 
-LDLIBS += $(LDLIBS_libxenstore) $(LDLIBS_libxenvchan)
+LDLIBS += $(LDLIBS_libxenstore) $(LDLIBS_libxenvchan) $(LDLIBS_libxl_json) $(LDLIBS_libxl)
 
 .PHONY: all
 all: xenpcid
@@ -26,6 +27,6 @@ uninstall:
 	rm -f $(DESTDIR)$(sbindir)/xenpcid
 
 xenpcid: xenpcid.o Makefile
-	$(CC) $(LDFLAGS) $< -o $@ $(LDLIBS) $(APPEND_LDFLAGS)
+	$(CC) $(LDFLAGS) $< -o $@ $(LDLIBS) -lyajl $(APPEND_LDFLAGS)
 
 -include $(DEPS_INCLUDE)
