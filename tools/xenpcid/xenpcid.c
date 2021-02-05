@@ -154,6 +154,8 @@ static int handle_ls_command(char *dir_name, struct list_head **result)
 
     if (strcmp(XENPCID_PCIBACK_DRIVER, dir_name) == 0) {
         dir = opendir(SYSFS_PCIBACK_DRIVER);
+    } else if (strcmp(XENPCID_PCI_DEV, dir_name) == 0){
+        dir = opendir(SYSFS_PCI_DEV);
     } else {
         fprintf(stderr, "Unknown directory: %s\n", dir_name);
         goto out;
