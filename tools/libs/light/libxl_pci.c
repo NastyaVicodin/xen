@@ -18,12 +18,359 @@
 
 #include "libxl_internal.h"
 
+#include <libxenvchan.h>
+#include <xenpcid.h>
+
 #define PCI_BDF                "%04x:%02x:%02x.%01x"
 #define PCI_BDF_SHORT          "%02x:%02x.%01x"
 #define PCI_BDF_VDEVFN         "%04x:%02x:%02x.%01x@%02x"
 #define PCI_OPTIONS            "msitranslate=%d,power_mgmt=%d"
 #define PCI_BDF_XSPATH         "%04x-%02x-%02x-%01x"
 #define PCI_PT_QDEV_ID         "pci-pt-%02x_%02x.%01x"
+
+/*
+ *******************************************************************************
+ * xenpcid support start
+ *******************************************************************************
+ */
+struct vchan_state {
+    /* Server domain ID. */
+    libxl_domid domid;
+    /* XenStore path of the server with the ring buffer and event channel. */
+    char *xs_path;
+
+    struct libxenvchan *ctrl;
+    int select_fd;
+    /* receive buffer */
+    char *rx_buf;
+    size_t rx_buf_size; /* current allocated size */
+    size_t rx_buf_used; /* actual data in the buffer */
+};
+
+/* Returns 1 if path exists, 0 if not, ERROR_* (<0) on error. */
+static int xs_path_exists(libxl__gc *gc, const char *xs_path)
+{
+    int rc;
+    const char *dir;
+
+    rc = libxl__xs_read_checked(gc, XBT_NULL, xs_path, &dir);
+    if ( rc )
+        return rc;
+    if ( dir )
+        return 1;
+    return 0;
+}
+
+static libxl_domid vchan_find_pcid_server(libxl_ctx *ctx)
+{
+    GC_INIT(ctx);
+    char **domains;
+    unsigned int i, n;
+    libxl_domid domid = DOMID_INVALID;
+
+    domains = libxl__xs_directory(gc, XBT_NULL, "/local/domain", &n);
+    if ( !n )
+        goto out;
+
+    for (i = 0; i < n; i++) {
+        int d;
+
+        if ( sscanf(domains[i], "%d", &d) != 1 )
+            continue;
+        if ( xs_path_exists(gc, GCSPRINTF(XENPCID_XS_PATH, d)) > 0 )
+        {
+            /* Found the domain where the pcid server lives. */
+            domid = d;
+            break;
+        }
+    }
+
+out:
+    GC_FREE;
+    return domid;
+}
+
+static int vchan_init_client(libxl__gc *gc, struct vchan_state *state)
+{
+    state->domid = vchan_find_pcid_server(CTX);
+    if ( state->domid == DOMID_INVALID )
+    {
+        LOGE(ERROR, "Can't find vchan server");
+        return ERROR_NOTFOUND;
+    }
+
+    state->xs_path = strdup(GCSPRINTF(XENPCID_XS_PATH, state->domid));
+    state->ctrl = libxenvchan_client_init(CTX->lg, state->domid,
+                                          state->xs_path);
+    if ( !state->ctrl )
+    {
+        LOGE(ERROR, "Couldn't intialize vchan client");
+        return ERROR_FAIL;
+    }
+    state->select_fd = libxenvchan_fd_for_select(state->ctrl);
+    LOG(INFO, "Intialized vchan client, server at %s", state->xs_path);
+    return 0;
+}
+
+static struct vchan_state *vchan_get_instance(libxl__gc *gc)
+{
+    static struct vchan_state *state = NULL;
+    int ret;
+
+    if ( state )
+        return state;
+
+    state = libxl__zalloc(gc, sizeof(*state));
+    ret = vchan_init_client(gc, state);
+    if ( ret )
+    {
+        state = NULL;
+        goto out;
+    }
+out:
+    return state;
+}
+
+static char *vchan_prepare_cmd(libxl__gc *gc, const char *cmd,
+                               const libxl__json_object *args,
+                               int id)
+{
+    yajl_gen hand = NULL;
+    /* memory for 'buf' is owned by 'hand' */
+    const unsigned char *buf;
+    libxl_yajl_length len;
+    yajl_gen_status s;
+    char *ret = NULL;
+
+    hand = libxl_yajl_gen_alloc(NULL);
+
+    if ( !hand ) {
+        return NULL;
+    }
+
+#if HAVE_YAJL_V2
+    /* Disable beautify for data sent to QEMU */
+    yajl_gen_config(hand, yajl_gen_beautify, 0);
+#endif
+
+    yajl_gen_map_open(hand);
+    libxl__yajl_gen_asciiz(hand, XENPCID_MSG_EXECUTE);
+    libxl__yajl_gen_asciiz(hand, cmd);
+    libxl__yajl_gen_asciiz(hand, XENPCID_MSG_FIELD_ID);
+    yajl_gen_integer(hand, id);
+    if ( args ) {
+        libxl__yajl_gen_asciiz(hand, XENPCID_MSG_FIELD_ARGS);
+        libxl__json_object_to_yajl_gen(gc, hand, args);
+    }
+    yajl_gen_map_close(hand);
+
+    s = yajl_gen_get_buf(hand, &buf, &len);
+
+    if ( s != yajl_gen_status_ok )
+        goto out;
+
+    ret = libxl__sprintf(gc, "%*.*s" XENPCID_END_OF_MESSAGE,
+                         (int)len, (int)len, buf);
+
+out:
+    yajl_gen_free(hand);
+    return ret;
+}
+
+static int vchan_get_next_msg(libxl__gc *gc, struct vchan_state *state,
+                              libxl__json_object **o_r)
+    /* Find a JSON object and store it in o_r.
+     * return ERROR_NOTFOUND if no object is found.
+     */
+{
+    size_t len;
+    char *end = NULL;
+    const char eom[] = XENPCID_END_OF_MESSAGE;
+    const size_t eoml = sizeof(eom) - 1;
+    libxl__json_object *o = NULL;
+
+    if ( !state->rx_buf_used )
+        return ERROR_NOTFOUND;
+
+    /* Search for the end of a message: "\r\n" */
+    end = memmem(state->rx_buf, state->rx_buf_used, eom, eoml);
+    if ( !end )
+        return ERROR_NOTFOUND;
+    len = (end - state->rx_buf) + eoml;
+
+    LOGD(DEBUG, state->domid, "parsing %luB: '%.*s'", len, (int)len,
+         state->rx_buf);
+
+    /* Replace \r by \0 so that libxl__json_parse can use strlen */
+    state->rx_buf[len - eoml] = '\0';
+    o = libxl__json_parse(gc, state->rx_buf);
+
+    if ( !o ) {
+        LOGD(ERROR, state->domid, "Parse error");
+        return ERROR_PROTOCOL_ERROR_PCID;
+    }
+
+    state->rx_buf_used -= len;
+    memmove(state->rx_buf, state->rx_buf + len, state->rx_buf_used);
+
+    LOGD(DEBUG, state->domid, "JSON object received: %s", JSON(o));
+
+    *o_r = o;
+
+    return 0;
+}
+
+static libxl__pcid_message_type pcid_response_type(const libxl__json_object *o)
+{
+    libxl__pcid_message_type type;
+    libxl__json_map_node *node = NULL;
+    int i = 0;
+
+    for (i = 0; (node = libxl__json_map_node_get(o, i)); i++) {
+        if (libxl__pcid_message_type_from_string(node->map_key, &type) == 0)
+            return type;
+    }
+    return LIBXL__PCID_MESSAGE_TYPE_INVALID;
+}
+
+static int vchan_handle_message(libxl__gc *gc,
+                                struct vchan_state *state,
+                                const libxl__json_object *resp,
+                                const libxl__json_object **result)
+{
+    libxl__pcid_message_type type = pcid_response_type(resp);
+
+    *result = NULL;
+    switch (type)
+    {
+    case LIBXL__PCID_MESSAGE_TYPE_RETURN:
+        *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_ARRAY);
+        if ( !(*result) )
+            *result = libxl__json_map_get(XENPCID_MSG_RETURN, resp, JSON_STRING);
+        return 0;
+    case LIBXL__PCID_MESSAGE_TYPE_ERROR:
+        LOGE(ERROR, "Error occured during command processing.");
+        break;
+    case LIBXL__PCID_MESSAGE_TYPE_INVALID:
+        return ERROR_PROTOCOL_ERROR_PCID;
+    default:
+        break;
+    }
+    return ERROR_INVAL;
+}
+
+#define QMP_RECEIVE_BUFFER_SIZE 4096
+#define QMP_MAX_SIZE_RX_BUF MB(1)
+
+static int vchan_read_reply(libxl__gc *gc,
+                            struct vchan_state *state,
+                            const libxl__json_object **result)
+{
+    int rc;
+    ssize_t r;
+
+    while ( true )
+    {
+        while ( true )
+        {
+            libxl__json_object *o = NULL;
+
+            /* parse rx buffer to find one json object */
+            rc = vchan_get_next_msg(gc, state, &o);
+            if ( rc == ERROR_NOTFOUND )
+                break;
+            else if ( rc )
+                return rc;
+
+            return vchan_handle_message(gc, state, o, result);
+        }
+
+        /* Check if the buffer still have space, or increase size */
+        if ( state->rx_buf_size - state->rx_buf_used < QMP_RECEIVE_BUFFER_SIZE )
+        {
+            size_t newsize = state->rx_buf_size * 2 + QMP_RECEIVE_BUFFER_SIZE;
+
+            if ( newsize > QMP_MAX_SIZE_RX_BUF )
+            {
+                LOGD(ERROR, state->domid,
+                     "pcid receive buffer is too big (%zu > %lld)",
+                     newsize, QMP_MAX_SIZE_RX_BUF);
+                return ERROR_BUFFERFULL;
+            }
+            state->rx_buf_size = newsize;
+            state->rx_buf = libxl__realloc(gc, state->rx_buf,
+                                           state->rx_buf_size);
+        }
+
+        while ( libxenvchan_data_ready(state->ctrl) )
+        {
+            r = libxenvchan_read(state->ctrl,
+                                 state->rx_buf + state->rx_buf_used,
+                                 state->rx_buf_size - state->rx_buf_used);
+            if ( r < 0 )
+            {
+                LOGED(ERROR, state->domid, "error reading from pcid");
+                return ERROR_FAIL;
+            }
+
+            LOGE(DEBUG, "received %ldB: '%.*s'", r,
+                 (int)r, state->rx_buf + state->rx_buf_used);
+
+            state->rx_buf_used += r;
+            assert(state->rx_buf_used <= state->rx_buf_size);
+        }
+    }
+    return 0;
+}
+
+static int vchan_write(libxl__gc *gc, struct vchan_state *state, char *cmd)
+{
+    int len, ret;
+
+    len = strlen(cmd);
+    while ( len )
+    {
+        ret = libxenvchan_write(state->ctrl, cmd, len);
+        if ( ret < 0 )
+        {
+            LOGE(ERROR, "vchan write failed");
+            return ERROR_FAIL;
+        }
+        if ( ret > 0 )
+        {
+            cmd += ret;
+            len -= ret;
+        }
+    }
+    return 0;
+}
+
+static const libxl__json_object *vchan_send_command(libxl__gc *gc,
+                                                    struct vchan_state *state,
+                                                    const char *cmd,
+                                                    const libxl__json_object *args)
+{
+    const libxl__json_object *result = NULL;
+    char *json;
+    int ret;
+
+    json = vchan_prepare_cmd(gc, cmd, args, 0);
+    if ( !json )
+        return NULL;
+
+    ret = vchan_write(gc, state, json);
+    if ( ret < 0 )
+        return NULL;
+
+    ret = vchan_read_reply(gc, state, &result);
+    return result;
+}
+
+/*
+ *******************************************************************************
+ * xenpcid support stop
+ *******************************************************************************
+ */
 
 static unsigned int pci_encode_bdf(libxl_device_pci *pci)
 {
@@ -358,28 +705,35 @@ static bool is_pci_in_array(libxl_device_pci *pcis, int num,
 }
 
 /* Write the standard BDF into the sysfs path given by sysfs_path. */
-static int sysfs_write_bdf(libxl__gc *gc, const char * sysfs_path,
+static int sysfs_write_bdf(libxl__gc *gc, const char *sysfs_path,
+                           const char *pci_path,
                            libxl_device_pci *pci)
 {
-    int rc, fd;
     char *buf;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    fd = open(sysfs_path, O_WRONLY);
-    if (fd < 0) {
-        LOGE(ERROR, "Couldn't open %s", sysfs_path);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return ERROR_FAIL;
+
+    buf = GCSPRINTF(PCI_BDF, pci->domain, pci->bus, pci->dev, pci->func);
+    if (strcmp(SYSFS_PCI_DEV, sysfs_path) == 0) {
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID, XENPCID_PCI_DEV);
+    } else if (strcmp(SYSFS_PCIBACK_DRIVER, sysfs_path) == 0) {
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID, XENPCID_PCIBACK_DRIVER);
+    } else if (strcmp(SYSFS_DRIVER_PATH, sysfs_path) == 0) {
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID, SYSFS_DRIVER_PATH);
+    }
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_PATH, pci_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, buf);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_WRITE, args);
+    if ( !result )
+    {
+        LOGE(WARN, "Write %s to %s failed\n", buf, sysfs_path);
         return ERROR_FAIL;
     }
-
-    buf = GCSPRINTF(PCI_BDF, pci->domain, pci->bus,
-                    pci->dev, pci->func);
-    rc = write(fd, buf, strlen(buf));
-    /* Annoying to have two if's, but we need the errno */
-    if (rc < 0)
-        LOGE(ERROR, "write to %s returned %d", sysfs_path, rc);
-    close(fd);
-
-    if (rc < 0)
-        return ERROR_FAIL;
 
     return 0;
 }
@@ -429,8 +783,10 @@ static void pci_info_xs_remove(libxl__gc *gc, libxl_device_pci *pci,
 
 libxl_device_pci *libxl_device_pci_assignable_list(libxl_ctx *ctx, int *num)
 {
+#if 0
+{
     GC_INIT(ctx);
-    libxl_device_pci *pcis = NULL, *new;
+    libxl_pci_bdf *pcibdfs = NULL, *new;
     struct dirent *de;
     DIR *dir;
 
@@ -447,10 +803,57 @@ libxl_device_pci *libxl_device_pci_assignable_list(libxl_ctx *ctx, int *num)
     }
 
     while((de = readdir(dir))) {
-        unsigned int dom, bus, dev, func;
-        char *name;
-
+        unsigned dom, bus, dev, func;
         if (sscanf(de->d_name, PCI_BDF, &dom, &bus, &dev, &func) != 4)
+            continue;
+
+        new = realloc(pcibdfs, ((*num) + 1) * sizeof(*new));
+        if (NULL == new)
+            continue;
+
+        pcibdfs = new;
+        new = pcibdfs + *num;
+
+        libxl_pci_bdf_init(new);
+        pcibdf_struct_fill(new, dom, bus, dev, func);
+
+        if (pci_info_xs_read(gc, new, "domid")) /* already assigned */
+            continue;
+
+        (*num)++;
+    }
+
+    closedir(dir);
+out:
+    GC_FREE;
+    return pcibdfs;
+}
+#else
+    GC_INIT(ctx);
+    libxl_device_pci *pcis = NULL, *new;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL, *dir;
+    int i;
+    char *name;
+    const char *dir_name;
+
+    *num = 0;
+
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        goto out;
+
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCIBACK_DRIVER);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_LIST, args);
+    if ( !result )
+        goto out;
+
+    for (i = 0; (dir = libxl__json_array_get(result, i)); i++) {
+        dir_name = libxl__json_object_get_string(dir);
+        unsigned dom, bus, dev, func;
+        if (sscanf(dir_name, PCI_BDF, &dom, &bus, &dev, &func) != 4)
             continue;
 
         new = realloc(pcis, ((*num) + 1) * sizeof(*new));
@@ -472,11 +875,11 @@ libxl_device_pci *libxl_device_pci_assignable_list(libxl_ctx *ctx, int *num)
         (*num)++;
     }
 
-    closedir(dir);
 out:
     GC_FREE;
     return pcis;
 }
+#endif
 
 void libxl_device_pci_assignable_list_free(libxl_device_pci *list, int num)
 {
@@ -493,35 +896,32 @@ void libxl_device_pci_assignable_list_free(libxl_device_pci *list, int num)
 static int sysfs_dev_unbind(libxl__gc *gc, libxl_device_pci *pci,
                             char **driver_path)
 {
-    char * spath, *dp = NULL;
-    struct stat st;
+    char *pci_path, *pci_info, *dp = NULL;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    spath = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/driver",
-                           pci->domain,
-                           pci->bus,
-                           pci->dev,
-                           pci->func);
-    if ( !lstat(spath, &st) ) {
-        /* Find the canonical path to the driver. */
-        dp = libxl__zalloc(gc, PATH_MAX);
-        dp = realpath(spath, dp);
-        if ( !dp ) {
-            LOGE(ERROR, "realpath() failed");
-            return -1;
-        }
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return ERROR_FAIL;
 
-        LOG(DEBUG, "Driver re-plug path: %s", dp);
-
-        /* Unbind from the old driver */
-        spath = GCSPRINTF("%s/unbind", dp);
-        if ( sysfs_write_bdf(gc, spath, pci) < 0 ) {
-            LOGE(ERROR, "Couldn't unbind device");
-            return -1;
-        }
+    pci_path = GCSPRINTF("/"PCI_BDF"/driver", pci->domain, pci->bus,
+                         pci->dev, pci->func);
+    pci_info = GCSPRINTF(PCI_BDF, pci->domain, pci->bus, pci->dev, pci->func);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_PATH, pci_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, pci_info);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_UNBIND, args);
+    if ( !result )
+    {
+        LOGE(WARN, "Write to %s%s failed\n", SYSFS_PCI_DEV, pci_path);
+        return -1;
     }
 
-    if ( driver_path )
+    if ( driver_path ) {
+        if (strcmp(result->u.string, "nolstat") != 0)
+            dp = (char *)libxl__json_object_get_string(result);
         *driver_path = dp;
+    }
 
     return 0;
 }
@@ -529,26 +929,30 @@ static int sysfs_dev_unbind(libxl__gc *gc, libxl_device_pci *pci,
 static uint16_t sysfs_dev_get_vendor(libxl__gc *gc, libxl_device_pci *pci)
 {
     char *pci_device_vendor_path =
-            GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/vendor",
-                      pci->domain, pci->bus, pci->dev, pci->func);
-    uint16_t read_items;
+            GCSPRINTF("/"PCI_BDF"/vendor", pci->domain, pci->bus,
+                      pci->dev, pci->func);
     uint16_t pci_device_vendor;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_vendor_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have vendor attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
         return 0xffff;
-    }
-    read_items = fscanf(f, "0x%hx\n", &pci_device_vendor);
-    fclose(f);
-    if (read_items != 1) {
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO,
+                                pci_device_vendor_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCI_DEV);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+    if ( !result )
+    {
         LOGE(ERROR,
              "cannot read vendor of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
         return 0xffff;
     }
+
+    pci_device_vendor = libxl__json_object_get_integer(result);
 
     return pci_device_vendor;
 }
@@ -556,26 +960,29 @@ static uint16_t sysfs_dev_get_vendor(libxl__gc *gc, libxl_device_pci *pci)
 static uint16_t sysfs_dev_get_device(libxl__gc *gc, libxl_device_pci *pci)
 {
     char *pci_device_device_path =
-            GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/device",
-                      pci->domain, pci->bus, pci->dev, pci->func);
-    uint16_t read_items;
+            GCSPRINTF("/"PCI_BDF"/device", pci->domain, pci->bus,
+                      pci->dev, pci->func);
     uint16_t pci_device_device;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_device_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have device attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
         return 0xffff;
-    }
-    read_items = fscanf(f, "0x%hx\n", &pci_device_device);
-    fclose(f);
-    if (read_items != 1) {
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO,
+                                pci_device_device_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCI_DEV);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+    if ( !result ) {
         LOGE(ERROR,
              "cannot read device of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
         return 0xffff;
     }
+
+    pci_device_device = libxl__json_object_get_integer(result);
 
     return pci_device_device;
 }
@@ -583,29 +990,32 @@ static uint16_t sysfs_dev_get_device(libxl__gc *gc, libxl_device_pci *pci)
 static int sysfs_dev_get_class(libxl__gc *gc, libxl_device_pci *pci,
                                unsigned long *class)
 {
-    char *pci_device_class_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/class",
-                     pci->domain, pci->bus, pci->dev, pci->func);
-    int read_items, ret = 0;
+    char *pci_device_class_path = GCSPRINTF("/"PCI_BDF"/class",
+                                            pci->domain, pci->bus,
+                                            pci->dev, pci->func);
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_class_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have class attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
-        ret = ERROR_FAIL;
-        goto out;
-    }
-    read_items = fscanf(f, "0x%lx\n", class);
-    fclose(f);
-    if (read_items != 1) {
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return ERROR_FAIL;
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO,
+                                pci_device_class_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCI_DEV);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+
+    if ( !result ) {
         LOGE(ERROR,
              "cannot read class of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
-        ret = ERROR_FAIL;
+        return ERROR_FAIL;
     }
 
-out:
-    return ret;
+    *class = libxl__json_object_get_integer(result);
+
+    return 0;
 }
 
 /*
@@ -716,14 +1126,14 @@ static int pciback_dev_assign(libxl__gc *gc, libxl_device_pci *pci)
         LOGE(ERROR, "Error checking for pciback slot");
         return ERROR_FAIL;
     } else if (rc == 0) {
-        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER"/new_slot",
+        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER, "/new_slot",
                              pci) < 0 ) {
             LOGE(ERROR, "Couldn't bind device to pciback!");
             return ERROR_FAIL;
         }
     }
 
-    if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER"/bind", pci) < 0 ) {
+    if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER, "/bind", pci) < 0 ) {
         LOGE(ERROR, "Couldn't bind device to pciback!");
         return ERROR_FAIL;
     }
@@ -740,7 +1150,7 @@ static int pciback_dev_unassign(libxl__gc *gc, libxl_device_pci *pci)
 
     /* Remove slot if necessary */
     if ( pciback_dev_has_slot(gc, pci) > 0 ) {
-        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER"/remove_slot",
+        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER, "/remove_slot",
                              pci) < 0 ) {
             LOGE(ERROR, "Couldn't remove pciback slot");
             return ERROR_FAIL;
@@ -811,9 +1221,9 @@ static int libxl__device_pci_assignable_add(libxl__gc *gc,
     /* Store driver_path for rebinding to dom0 */
     if ( rebind ) {
         if ( driver_path ) {
-            pci_info_xs_write(gc, pci, "driver_path", driver_path);
+            pci_info_xs_write(gc, pci, SYSFS_DRIVER_PATH, driver_path);
         } else if ( (driver_path =
-                     pci_info_xs_read(gc, pci, "driver_path")) != NULL ) {
+                     pci_info_xs_read(gc, pci, SYSFS_DRIVER_PATH)) != NULL ) {
             LOG(INFO, PCI_BDF" not bound to a driver, will be rebound to %s",
                 dom, bus, dev, func, driver_path);
         } else {
@@ -821,7 +1231,7 @@ static int libxl__device_pci_assignable_add(libxl__gc *gc,
                 dom, bus, dev, func);
         }
     } else {
-        pci_info_xs_remove(gc, pci, "driver_path");
+        pci_info_xs_remove(gc, pci, SYSFS_DRIVER_PATH);
     }
 
     if ( pciback_dev_assign(gc, pci) ) {
@@ -916,20 +1326,20 @@ static int libxl__device_pci_assignable_remove(libxl__gc *gc,
     }
 
     /* Rebind if necessary */
-    driver_path = pci_info_xs_read(gc, pci, "driver_path");
+    driver_path = pci_info_xs_read(gc, pci, SYSFS_DRIVER_PATH);
 
     if ( driver_path ) {
         if ( rebind ) {
             LOG(INFO, "Rebinding to driver at %s", driver_path);
 
-            if ( sysfs_write_bdf(gc,
+            if ( sysfs_write_bdf(gc, SYSFS_DRIVER_PATH,
                                  GCSPRINTF("%s/bind", driver_path),
                                  pci) < 0 ) {
                 LOGE(ERROR, "Couldn't bind device to %s", driver_path);
                 return -1;
             }
 
-            pci_info_xs_remove(gc, pci, "driver_path");
+            pci_info_xs_remove(gc, pci, SYSFS_DRIVER_PATH);
         }
     } else {
         if ( rebind ) {
@@ -975,23 +1385,31 @@ int libxl_device_pci_assignable_remove(libxl_ctx *ctx, libxl_device_pci *pci,
 */
 static int pci_multifunction_check(libxl__gc *gc, libxl_device_pci *pci, unsigned int *func_mask)
 {
-    struct dirent *de;
-    DIR *dir;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL, *dir;
+    const char *dir_name;
+    int i;
 
     *func_mask = 0;
 
-    dir = opendir(SYSFS_PCI_DEV);
-    if ( NULL == dir ) {
-        LOGE(ERROR, "Couldn't open %s", SYSFS_PCI_DEV);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
         return -1;
-    }
 
-    while( (de = readdir(dir)) ) {
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCI_DEV);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_LIST, args);
+    if ( !result )
+        return -1;
+
+    for (i = 0; (dir = libxl__json_array_get(result, i)); i++) {
+        dir_name = libxl__json_object_get_string(dir);
         unsigned dom, bus, dev, func;
         struct stat st;
         char *path;
 
-        if ( sscanf(de->d_name, PCI_BDF, &dom, &bus, &dev, &func) != 4 )
+        if ( sscanf(dir_name, PCI_BDF, &dom, &bus, &dev, &func) != 4 )
             continue;
         if ( pci->domain != dom )
             continue;
@@ -1007,13 +1425,11 @@ static int pci_multifunction_check(libxl__gc *gc, libxl_device_pci *pci, unsigne
                     dom, bus, dev, func);
             else
                 LOGE(ERROR, "Couldn't lstat %s", path);
-            closedir(dir);
             return -1;
         }
         (*func_mask) |= (1 << func);
     }
 
-    closedir(dir);
     return 0;
 }
 
@@ -1371,10 +1787,9 @@ static void pci_add_dm_done(libxl__egc *egc,
     STATE_AO_GC(pas->aodev->ao);
     libxl_ctx *ctx = libxl__gc_owner(gc);
     libxl_domid domid = pas->pci_domid;
-    char *sysfs_path;
-    FILE *f;
+    char *resource_path, *irq_path;
     unsigned long long start, end, flags, size;
-    int irq, i;
+    int irq, i, j;
     int r;
     uint32_t flag = XEN_DOMCTL_DEV_RDM_RELAXED;
     uint32_t domainid = domid;
@@ -1384,6 +1799,9 @@ static void pci_add_dm_done(libxl__egc *egc,
     bool starting = pas->starting;
     libxl_device_pci *pci = &pas->pci;
     bool hvm = libxl__domain_type(gc, domid) == LIBXL_DOMAIN_TYPE_HVM;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL, *addr;
 
     libxl__ev_qmp_dispose(gc, &pas->qmp);
 
@@ -1393,20 +1811,32 @@ static void pci_add_dm_done(libxl__egc *egc,
     if (isstubdom)
         starting = false;
 
-    sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/resource", pci->domain,
-                           pci->bus, pci->dev, pci->func);
-    f = fopen(sysfs_path, "r");
-    start = end = flags = size = 0;
-    irq = 0;
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        goto out;
 
-    if (f == NULL) {
-        LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+    resource_path = GCSPRINTF("/"PCI_BDF"/resource", pci->domain,
+                         pci->bus, pci->dev, pci->func);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, resource_path);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ_RESOURCES, args);
+    if ( !result ) {
+        LOGED(ERROR, domainid, "Couldn't get resources from %s", resource_path);
         rc = ERROR_FAIL;
         goto out;
     }
+
+    start = end = flags = size = 0;
+    irq = 0;
+    j = 0;
+
     for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
-        if (fscanf(f, "0x%llx 0x%llx 0x%llx\n", &start, &end, &flags) != 3)
-            continue;
+        addr = libxl__json_array_get(result, j++);
+        start = libxl__json_object_get_integer(addr);
+        addr = libxl__json_array_get(result, j++);
+        end = libxl__json_object_get_integer(addr);
+        addr = libxl__json_array_get(result, j++);
+        flags = libxl__json_object_get_integer(addr);
+
         size = end - start + 1;
         if (start) {
             if (flags & PCI_BAR_IO) {
@@ -1415,7 +1845,6 @@ static void pci_add_dm_done(libxl__egc *egc,
                     LOGED(ERROR, domainid,
                           "xc_domain_ioport_permission 0x%llx/0x%llx (error %d)",
                           start, size, r);
-                    fclose(f);
                     rc = ERROR_FAIL;
                     goto out;
                 }
@@ -1426,27 +1855,31 @@ static void pci_add_dm_done(libxl__egc *egc,
                     LOGED(ERROR, domainid,
                           "xc_domain_iomem_permission 0x%llx/0x%llx (error %d)",
                           start, size, r);
-                    fclose(f);
                     rc = ERROR_FAIL;
                     goto out;
                 }
             }
         }
     }
-    fclose(f);
-    sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/irq", pci->domain,
-                                pci->bus, pci->dev, pci->func);
-    f = fopen(sysfs_path, "r");
-    if (f == NULL) {
-        LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+
+    irq_path = GCSPRINTF("/"PCI_BDF"/irq", pci->domain,
+                         pci->bus, pci->dev, pci->func);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, irq_path);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                XENPCID_PCI_DEV);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+    if ( !result ) {
+        LOGED(ERROR, domainid, "Couldn't get irq from %s", irq_path);
+        rc = ERROR_FAIL;
         goto out_no_irq;
     }
-    if ((fscanf(f, "%u", &irq) == 1) && irq) {
+
+    irq = libxl__json_object_get_integer(result);
+    if ( irq ) {
         r = xc_physdev_map_pirq(ctx->xch, domid, irq, &irq);
         if (r < 0) {
             LOGED(ERROR, domainid, "xc_physdev_map_pirq irq=%d (error=%d)",
                   irq, r);
-            fclose(f);
             rc = ERROR_FAIL;
             goto out;
         }
@@ -1461,11 +1894,10 @@ static void pci_add_dm_done(libxl__egc *egc,
         }
 #endif
     }
-    fclose(f);
 
     /* Don't restrict writes to the PCI config space from this VM */
     if (pci->permissive) {
-        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER"/permissive",
+        if ( sysfs_write_bdf(gc, SYSFS_PCIBACK_DRIVER, "/permissive",
                              pci) < 0 ) {
             LOGD(ERROR, domainid, "Setting permissive for device");
             rc = ERROR_FAIL;
@@ -1502,38 +1934,27 @@ out:
 static int libxl__device_pci_reset(libxl__gc *gc, unsigned int domain, unsigned int bus,
                                    unsigned int dev, unsigned int func)
 {
-    char *reset;
-    int fd, rc;
+    char *reset, *buf;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    reset = GCSPRINTF("%s/do_flr", SYSFS_PCIBACK_DRIVER);
-    fd = open(reset, O_WRONLY);
-    if (fd >= 0) {
-        char *buf = GCSPRINTF(PCI_BDF, domain, bus, dev, func);
-        rc = write(fd, buf, strlen(buf));
-        if (rc < 0)
-            LOGD(ERROR, domain, "write to %s returned %d", reset, rc);
-        close(fd);
-        return rc < 0 ? rc : 0;
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return -1;
+
+    reset = GCSPRINTF("%s", "/do_flr");
+    buf = GCSPRINTF(PCI_BDF, domain, bus, dev, func);
+
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_PATH, reset);
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, buf);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_WRITE, args);
+    if ( !result ) {
+        LOGD(ERROR, domain, "write to %s returned error", reset);
+        return -1;
     }
-    if (errno != ENOENT)
-        LOGED(ERROR, domain, "Failed to access pciback path %s", reset);
-    reset = GCSPRINTF("%s/"PCI_BDF"/reset", SYSFS_PCI_DEV, domain, bus, dev, func);
-    fd = open(reset, O_WRONLY);
-    if (fd >= 0) {
-        rc = write(fd, "1", 1);
-        if (rc < 0)
-            LOGED(ERROR, domain, "write to %s returned %d", reset, rc);
-        close(fd);
-        return rc < 0 ? rc : 0;
-    }
-    if (errno == ENOENT) {
-        LOGD(ERROR, domain,
-             "The kernel doesn't support reset from sysfs for PCI device "PCI_BDF,
-             domain, bus, dev, func);
-    } else {
-        LOGED(ERROR, domain, "Failed to access reset path %s", reset);
-    }
-    return -1;
+
+    return 0;
 }
 
 int libxl__device_pci_setdefault(libxl__gc *gc, uint32_t domid,
@@ -1925,6 +2346,9 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
     libxl_device_pci *pci = &prs->pci;
     int rc, num;
     uint32_t domainid = domid;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL, *addr;
 
     pcis = libxl_device_pci_list(ctx, domid, &num);
     if (!pcis) {
@@ -1963,20 +2387,30 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
             goto out_fail;
         }
     } else {
-        char *sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/resource", pci->domain,
+        char *sysfs_path = GCSPRINTF("/"PCI_BDF"/resource", pci->domain,
                                      pci->bus, pci->dev, pci->func);
-        FILE *f = fopen(sysfs_path, "r");
         unsigned int start = 0, end = 0, flags = 0, size = 0;
         int irq = 0;
-        int i;
-
-        if (f == NULL) {
-            LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+        int i, j = 0;
+        vchan = vchan_get_instance(gc);
+        if ( !vchan )
+            goto out_fail;
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, sysfs_path);
+        result = vchan_send_command(gc, vchan, XENPCID_CMD_READ_RESOURCES, args);
+        if ( !result ) {
+            LOGED(ERROR, domainid, "Couldn't get resources from %s", sysfs_path);
+            rc = ERROR_FAIL;
             goto skip1;
         }
+
         for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
-            if (fscanf(f, "0x%x 0x%x 0x%x\n", &start, &end, &flags) != 3)
-                continue;
+            addr = libxl__json_array_get(result, j++);
+            start = libxl__json_object_get_integer(addr);
+            addr = libxl__json_array_get(result, j++);
+            end = libxl__json_object_get_integer(addr);
+            addr = libxl__json_array_get(result, j++);
+            flags = libxl__json_object_get_integer(addr);
+
             size = end - start + 1;
             if (start) {
                 if (flags & PCI_BAR_IO) {
@@ -1997,16 +2431,22 @@ static void do_pci_remove(libxl__egc *egc, pci_remove_state *prs)
                 }
             }
         }
-        fclose(f);
+
 skip1:
-        sysfs_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/irq", pci->domain,
+        sysfs_path = GCSPRINTF("/"PCI_BDF"/irq", pci->domain,
                                pci->bus, pci->dev, pci->func);
-        f = fopen(sysfs_path, "r");
-        if (f == NULL) {
-            LOGED(ERROR, domainid, "Couldn't open %s", sysfs_path);
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_PCI_INFO, sysfs_path);
+        libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_DIR_ID,
+                                    XENPCID_PCI_DEV);
+        result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+        if ( !result ) {
+            LOGED(ERROR, domainid, "Couldn't get irq from %s", sysfs_path);
+            rc = ERROR_FAIL;
             goto skip_irq;
         }
-        if ((fscanf(f, "%u", &irq) == 1) && irq) {
+
+        irq = libxl__json_object_get_integer(result);
+        if ( irq ) {
             rc = xc_physdev_unmap_pirq(ctx->xch, domid, irq);
             if (rc < 0) {
                 LOGED(ERROR, domainid, "xc_physdev_unmap_pirq irq=%d", irq);
@@ -2016,7 +2456,6 @@ skip1:
                 LOGED(ERROR, domainid, "xc_domain_irq_permission irq=%d", irq);
             }
         }
-        fclose(f);
     }
 skip_irq:
     rc = 0;
