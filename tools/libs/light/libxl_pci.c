@@ -723,7 +723,7 @@ static int sysfs_write_bdf(libxl__gc *gc, const char * sysfs_path,
     result = vchan_send_command(gc, vchan, XENPCID_CMD_WRITE, args);
     if ( !result )
     {
-        LOGE(WARN, "Write to %s/%s failed\n", sysfs_path, buf);
+        LOGE(WARN, "Write %s to %s failed\n", buf, sysfs_path);
         return ERROR_FAIL;
     }
 
@@ -926,24 +926,26 @@ static uint16_t sysfs_dev_get_vendor(libxl__gc *gc, libxl_device_pci *pci)
     char *pci_device_vendor_path =
             GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/vendor",
                       pci->domain, pci->bus, pci->dev, pci->func);
-    uint16_t read_items;
     uint16_t pci_device_vendor;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_vendor_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have vendor attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
         return 0xffff;
-    }
-    read_items = fscanf(f, "0x%hx\n", &pci_device_vendor);
-    fclose(f);
-    if (read_items != 1) {
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_SYSFS_PATH,
+                                pci_device_vendor_path);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+    if ( !result )
+    {
         LOGE(ERROR,
              "cannot read vendor of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
         return 0xffff;
     }
+
+    pci_device_vendor = libxl__json_object_get_integer(result);
 
     return pci_device_vendor;
 }
@@ -953,24 +955,25 @@ static uint16_t sysfs_dev_get_device(libxl__gc *gc, libxl_device_pci *pci)
     char *pci_device_device_path =
             GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/device",
                       pci->domain, pci->bus, pci->dev, pci->func);
-    uint16_t read_items;
     uint16_t pci_device_device;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_device_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have device attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
         return 0xffff;
-    }
-    read_items = fscanf(f, "0x%hx\n", &pci_device_device);
-    fclose(f);
-    if (read_items != 1) {
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_SYSFS_PATH,
+                                pci_device_device_path);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+    if ( !result ) {
         LOGE(ERROR,
              "cannot read device of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
         return 0xffff;
     }
+
+    pci_device_device = libxl__json_object_get_integer(result);
 
     return pci_device_device;
 }
@@ -980,27 +983,27 @@ static int sysfs_dev_get_class(libxl__gc *gc, libxl_device_pci *pci,
 {
     char *pci_device_class_path = GCSPRINTF(SYSFS_PCI_DEV"/"PCI_BDF"/class",
                      pci->domain, pci->bus, pci->dev, pci->func);
-    int read_items, ret = 0;
+    struct vchan_state *vchan;
+    libxl__json_object *args = NULL;
+    const libxl__json_object *result = NULL;
 
-    FILE *f = fopen(pci_device_class_path, "r");
-    if (!f) {
-        LOGE(ERROR,
-             "pci device "PCI_BDF" does not have class attribute",
-             pci->domain, pci->bus, pci->dev, pci->func);
-        ret = ERROR_FAIL;
-        goto out;
-    }
-    read_items = fscanf(f, "0x%lx\n", class);
-    fclose(f);
-    if (read_items != 1) {
+    vchan = vchan_get_instance(gc);
+    if ( !vchan )
+        return ERROR_FAIL;
+    libxl__qmp_param_add_string(gc, &args, XENPCID_CMD_SYSFS_PATH,
+                                pci_device_class_path);
+    result = vchan_send_command(gc, vchan, XENPCID_CMD_READ, args);
+
+    if ( !result ) {
         LOGE(ERROR,
              "cannot read class of pci device "PCI_BDF,
              pci->domain, pci->bus, pci->dev, pci->func);
-        ret = ERROR_FAIL;
+        return ERROR_FAIL;
     }
 
-out:
-    return ret;
+    *class = libxl__json_object_get_integer(result);
+
+    return 0;
 }
 
 /*

@@ -34,6 +34,7 @@
 #define XENPCID_CMD_LIST_DIR_ID     "dir_id"
 
 #define XENPCID_CMD_WRITE           "write"
+#define XENPCID_CMD_READ            "read"
 #define XENPCID_CMD_SYSFS_PATH      "sysfs_path"
 #define XENPCID_CMD_PCI_INFO        "pci_info"
 
