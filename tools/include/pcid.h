@@ -32,6 +32,7 @@
 
 #define PCID_CMD_LIST            "ls"
 #define PCID_CMD_UNBIND          "unbind"
+#define PCID_CMD_RESET           "reset"
 #define PCID_CMD_DIR_ID          "dir_id"
 
 #define PCID_CMD_WRITE           "write"
@@ -84,6 +85,7 @@ enum pcid__json_resp_type {
     PCID_JSON_EXISTS = (1 << 3),
     PCID_JSON_LIST_RSC = (1 << 4),
     PCID_JSON_UNBIND = (1 << 5),
+    PCID_JSON_RESET = (1 << 6),
     PCID_JSON_ANY = 255 /* this is a mask of all values above, adjust as needed */
 };
 

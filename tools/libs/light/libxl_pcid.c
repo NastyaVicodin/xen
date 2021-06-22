@@ -220,6 +220,28 @@ out:
     return result;
 }
 
+static struct pcid__json_object *process_reset_cmd(libxl__gc *gc,
+                                                   struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *pci_path, *pci_info;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    pci_info = libxl__json_map_get(PCID_CMD_PCI_INFO, args, JSON_ANY);
+    if (!pci_info)
+        goto out;
+    pci_path = libxl__json_map_get(PCID_CMD_PCI_PATH, args, JSON_ANY);
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_RESET);
+    result->string = pci_path->u.string;
+    result->info = pci_info->u.string;
+
+out:
+    return result;
+}
+
 static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
                                 struct libxl__json_object *resp,
                                 struct pcid__json_object **result)
@@ -242,6 +264,8 @@ static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
         (*result) = process_read_rsc_cmd(gc, resp);
     else if (strcmp(command_name, PCID_CMD_UNBIND) == 0)
         (*result) = process_unbind_cmd(gc, resp);
+    else if (strcmp(command_name, PCID_CMD_RESET) == 0)
+        (*result) = process_reset_cmd(gc, resp);
     else
         LOGE(ERROR, "Unknown command: %s\n", command_name);
 
@@ -328,7 +352,8 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
             yajl_gen_array_close(hand);
         } else if (result->type == PCID_JSON_WRITE ||
                    result->type == PCID_JSON_EXISTS ||
-                   result->type == PCID_JSON_UNBIND) {
+                   result->type == PCID_JSON_UNBIND ||
+                   result->type == PCID_JSON_RESET) {
             if (result->string)
                 libxl__yajl_gen_asciiz(hand, result->string);
             else

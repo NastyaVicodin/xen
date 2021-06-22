@@ -308,6 +308,49 @@ fail:
     return -1;
 }
 
+static int handle_reset_cmd(char *pci_path, char *pci_info)
+{
+    char *reset;
+    int rc, fd;
+
+    reset = (char *)pcid_zalloc(strlen(SYSFS_PCIBACK_DRIVER) + strlen(pci_path) + 1);
+    sprintf(reset, SYSFS_PCIBACK_DRIVER"%s", pci_path);
+
+    fd = open(reset, O_WRONLY);
+    if (fd >= 0) {
+        rc = write(fd, pci_info, strlen(pci_info));
+        if (rc < 0)
+            fprintf(stderr, "write to %s returned %d\n", reset, rc);
+        close(fd);
+        free(reset);
+        return rc < 0 ? rc : 0;
+    }
+    if (errno != ENOENT)
+        fprintf(stderr, "Failed to access pciback path %s\n", reset);
+    free(reset);
+    reset = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) + strlen(pci_info) +
+                                strlen("//reset") + 1);
+    sprintf(reset, "%s/%s/reset", SYSFS_PCI_DEV, pci_info);
+    fd = open(reset, O_WRONLY);
+    if (fd >= 0) {
+        rc = write(fd, "1", 1);
+        if (rc < 0)
+            fprintf(stderr, "write to %s returned %d\n", reset, rc);
+        close(fd);
+        free(reset);
+        return rc < 0 ? rc : 0;
+    }
+    if (errno == ENOENT) {
+        fprintf(stderr,
+                "The kernel doesn't support reset from sysfs for PCI device %s\n",
+                pci_info);
+    } else {
+        fprintf(stderr, "Failed to access reset path %s\n", reset);
+    }
+    free(reset);
+    return -1;
+}
+
 static int pcid_handle_cmd(struct pcid__json_object **result)
 {
     struct pcid_list *dir_list = NULL;
@@ -347,6 +390,10 @@ static int pcid_handle_cmd(struct pcid__json_object **result)
         if (ret < 0)
             goto fail;
         (*result)->string = full_path;
+    } else if (command_name == PCID_JSON_RESET) {
+        ret = handle_reset_cmd((*result)->string, (*result)->info);
+        if (ret < 0)
+            goto fail;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto fail;
