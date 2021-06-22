@@ -180,11 +180,33 @@ static int handle_write_cmd(char *sysfs_path, char *pci_info)
     return 0;
 }
 
+static long long handle_read_hex_cmd(char *sysfs_path)
+{
+    uint16_t read_items;
+    long long result;
+    FILE *f = fopen(sysfs_path, "r");
+
+    if (!f) {
+        fprintf(stderr, "PCI device %s does not have needed attribute\n",
+                sysfs_path);
+        return -1;
+    }
+    read_items = fscanf(f, "0x%llx\n", &result);
+    fclose(f);
+    if (read_items != 1) {
+        fprintf(stderr, "Cannot read attribute of pci device %s\n", sysfs_path);
+        return -1;
+    }
+
+    return result;
+}
+
 static int pcid_handle_cmd(struct pcid__json_object **result)
 {
     struct pcid_list *dir_list = NULL;
     int ret;
     int command_name = (*result)->type;
+    long long read_result;
 
     if (command_name == PCID_JSON_LIST) {
         ret = handle_ls_command((*result)->string, &dir_list);
@@ -196,6 +218,11 @@ static int pcid_handle_cmd(struct pcid__json_object **result)
         if (ret != 0)
             goto fail;
         (*result)->string = NULL;
+    } else if (command_name == PCID_JSON_READ_HEX) {
+        read_result = handle_read_hex_cmd((*result)->string);
+        if (read_result < 0)
+            goto fail;
+        (*result)->i = read_result;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto fail;

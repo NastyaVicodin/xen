@@ -34,6 +34,7 @@
 #define PCID_CMD_DIR_ID          "dir_id"
 
 #define PCID_CMD_WRITE           "write"
+#define PCID_CMD_READ_HEX        "read_hex"
 #define PCID_CMD_PCI_PATH        "pci_path"
 #define PCID_CMD_PCI_INFO        "pci_info"
 
@@ -75,6 +76,7 @@ struct vchan_state {
 enum pcid__json_resp_type {
     PCID_JSON_LIST = (1 << 0),
     PCID_JSON_WRITE = (1 << 1),
+    PCID_JSON_READ_HEX = (1 << 2),
     PCID_JSON_ANY = 255 /* this is a mask of all values above, adjust as needed */
 };
 
