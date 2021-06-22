@@ -148,6 +148,34 @@ out:
     return result;
 }
 
+static struct pcid__json_object *process_exists_cmd(libxl__gc *gc,
+                                                    struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *pci_path, *pci_info;
+    char *full_path;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    pci_path = libxl__json_map_get(PCID_CMD_DIR_ID, args, JSON_ANY);
+    if (!pci_path)
+        goto out;
+    pci_info = libxl__json_map_get(PCID_CMD_PCI_INFO, args, JSON_ANY);
+    if (!pci_info)
+        goto out;
+    if (strcmp(pci_path->u.string, PCID_PCIBACK_DRIVER) == 0)
+        full_path = libxl__sprintf(gc, SYSFS_PCIBACK_DRIVER"%s", pci_info->u.string);
+    else
+        full_path = pci_info->u.string;
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_EXISTS);
+    result->string = full_path;
+
+out:
+    return result;
+}
+
 static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
                                 struct libxl__json_object *resp,
                                 struct pcid__json_object **result)
@@ -164,6 +192,8 @@ static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
         (*result) = process_write_cmd(gc, resp);
     else if (strcmp(command_name, PCID_CMD_READ_HEX) == 0)
         (*result) = process_read_hex_cmd(gc, resp);
+    else if (strcmp(command_name, PCID_CMD_EXISTS) == 0)
+        (*result) = process_exists_cmd(gc, resp);
     else
         LOGE(ERROR, "Unknown command: %s\n", command_name);
 
@@ -236,7 +266,8 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
                 }
             }
             yajl_gen_array_close(hand);
-        } else if (result->type == PCID_JSON_WRITE) {
+        } else if (result->type == PCID_JSON_WRITE ||
+                   result->type == PCID_JSON_EXISTS) {
             if (result->string)
                 libxl__yajl_gen_asciiz(hand, result->string);
             else

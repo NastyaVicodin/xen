@@ -41,6 +41,9 @@
 #include <dirent.h>
 #include "xl_pcid.h"
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #define BUFSIZE 4096
 /*
  * TODO: Running this code in multi-threaded environment
@@ -201,6 +204,21 @@ static long long handle_read_hex_cmd(char *sysfs_path)
     return result;
 }
 
+static int handle_exists_cmd(char *path)
+{
+    struct stat st;
+
+    if (lstat(path, &st)) {
+        if (errno == ENOENT)
+            fprintf(stderr, "%s is not assigned to pciback driver", path);
+        else
+            fprintf(stderr, "Couldn't lstat %s", path);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int pcid_handle_cmd(struct pcid__json_object **result)
 {
     struct pcid_list *dir_list = NULL;
@@ -223,6 +241,11 @@ static int pcid_handle_cmd(struct pcid__json_object **result)
         if (read_result < 0)
             goto fail;
         (*result)->i = read_result;
+    } else if (command_name == PCID_JSON_EXISTS) {
+        ret = handle_exists_cmd((*result)->string);
+        if (ret != 0)
+            goto fail;
+        (*result)->string = NULL;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto fail;
