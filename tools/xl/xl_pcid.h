@@ -21,4 +21,6 @@
 /* TODO: Determine id of control domain and use it all over the code */
 #define DOM0_ID 0
 
+#define PROC_PCI_NUM_RESOURCES 7
+
 #endif /* XL_PCID_H */

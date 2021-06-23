@@ -176,6 +176,50 @@ out:
     return result;
 }
 
+static struct pcid__json_object *process_read_rsc_cmd(libxl__gc *gc,
+                                                      struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *pci_info;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    pci_info = libxl__json_map_get(PCID_CMD_PCI_INFO, args, JSON_ANY);
+    if (!pci_info)
+        goto out;
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_LIST_RSC);
+    result->string = pci_info->u.string;
+
+out:
+    return result;
+}
+
+static struct pcid__json_object *process_unbind_cmd(libxl__gc *gc,
+                                                    struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *pci_path, *pci_info;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    pci_info = libxl__json_map_get(PCID_CMD_PCI_INFO, args, JSON_ANY);
+    if (!pci_info)
+        goto out;
+    pci_path = libxl__json_map_get(PCID_CMD_PCI_PATH, args, JSON_ANY);
+    if (!pci_path)
+        goto out;
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_UNBIND);
+    result->string = pci_path->u.string;
+    result->info = pci_info->u.string;
+
+out:
+    return result;
+}
+
 static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
                                 struct libxl__json_object *resp,
                                 struct pcid__json_object **result)
@@ -194,6 +238,10 @@ static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
         (*result) = process_read_hex_cmd(gc, resp);
     else if (strcmp(command_name, PCID_CMD_EXISTS) == 0)
         (*result) = process_exists_cmd(gc, resp);
+    else if (strcmp(command_name, PCID_CMD_READ_RESOURCES) == 0)
+        (*result) = process_read_rsc_cmd(gc, resp);
+    else if (strcmp(command_name, PCID_CMD_UNBIND) == 0)
+        (*result) = process_unbind_cmd(gc, resp);
     else
         LOGE(ERROR, "Unknown command: %s\n", command_name);
 
@@ -240,6 +288,7 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
     yajl_gen_status s;
     char *ret = NULL;
     struct pcid_list *resp_list, *value;
+    struct pcid_list_resources *resp_rsc_list, *val_rsc;
 
     hand = libxl_yajl_gen_alloc(NULL);
     if (!hand) {
@@ -266,8 +315,20 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
                 }
             }
             yajl_gen_array_close(hand);
+        } else if (result->type == PCID_JSON_LIST_RSC) {
+            resp_rsc_list = result->list_rsc;
+            yajl_gen_array_open(hand);
+            if (!(LIBXL_LIST_EMPTY(&resp_rsc_list->head))) {
+                LIBXL_LIST_FOREACH(val_rsc, &resp_rsc_list->head, entry) {
+                    yajl_gen_integer(hand, val_rsc->start);
+                    yajl_gen_integer(hand, val_rsc->end);
+                    yajl_gen_integer(hand, val_rsc->flags);
+                }
+            }
+            yajl_gen_array_close(hand);
         } else if (result->type == PCID_JSON_WRITE ||
-                   result->type == PCID_JSON_EXISTS) {
+                   result->type == PCID_JSON_EXISTS ||
+                   result->type == PCID_JSON_UNBIND) {
             if (result->string)
                 libxl__yajl_gen_asciiz(hand, result->string);
             else

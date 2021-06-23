@@ -43,6 +43,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define BUFSIZE 4096
 /*
@@ -219,9 +220,99 @@ static int handle_exists_cmd(char *path)
     return 0;
 }
 
+static int handle_read_resources_cmd(char *pci_path,
+                                     struct pcid_list_resources **result)
+{
+    unsigned long long start, end, flags;
+    struct pcid_list_resources *list = NULL, *node = NULL;
+    int i;
+    char *sysfs_path;
+    FILE *f;
+
+    sysfs_path = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1);
+    sprintf(sysfs_path, SYSFS_PCI_DEV"%s", pci_path);
+    f = fopen(sysfs_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s\n", sysfs_path);
+        goto fail_open_file;
+    }
+
+    list = pcid_zalloc(sizeof(*list));
+    LIBXL_LIST_INIT(&list->head);
+    for (i = 0; i < PROC_PCI_NUM_RESOURCES; i++) {
+        if (fscanf(f, "0x%llx 0x%llx 0x%llx\n", &start, &end, &flags) != 3)
+            continue;
+
+        node = pcid_zalloc(sizeof(*node));
+        if (!node) {
+            fprintf(stderr, "Memory allocation failed\n");
+            goto fail_mem_alloc;
+        }
+        node->start = start;
+        node->end = end;
+        node->flags = flags;
+        LIBXL_LIST_INSERT_HEAD(&list->head, node, entry);
+    }
+    fclose(f);
+    free(sysfs_path);
+
+    *result = list;
+
+    return 0;
+
+fail_mem_alloc:
+    fclose(f);
+fail_open_file:
+    free(sysfs_path);
+    return -1;
+}
+
+static int handle_unbind_cmd(char *pci_path, char *pci_info, char **result)
+{
+    char *spath, *new_path, *dp = NULL;
+    struct stat st;
+
+    spath = (char *)pcid_zalloc(strlen(SYSFS_PCI_DEV) + strlen(pci_path) + 1);
+    sprintf(spath, SYSFS_PCI_DEV"%s", pci_path);
+
+    if (!lstat(spath, &st)) {
+        /* Find the canonical path to the driver. */
+        dp = (char *)pcid_zalloc(PATH_MAX);
+        if (!(realpath(spath, dp))) {
+            fprintf(stderr, "realpath() failed\n");
+            goto fail;
+        }
+        *result = dp;
+        new_path = (char *)pcid_zalloc(strlen(dp) + strlen("/unbind") + 1);
+        /* Unbind from the old driver */
+        sprintf(new_path, "%s/unbind", dp);
+
+        if (handle_write_cmd(new_path, pci_info) != 0) {
+            fprintf(stderr, "Couldn't unbind device\n");
+            goto fail_write;
+        }
+        free(new_path);
+    } else {
+        *result = (char *)pcid_zalloc(strlen("nolstat") + 1);
+        sprintf(*result, "nolstat");
+    }
+    free(spath);
+
+    return 0;
+
+fail_write:
+    free(new_path);
+fail:
+    free(spath);
+
+    return -1;
+}
+
 static int pcid_handle_cmd(struct pcid__json_object **result)
 {
     struct pcid_list *dir_list = NULL;
+    struct pcid_list_resources *resources_list = NULL;
+    char *full_path;
     int ret;
     int command_name = (*result)->type;
     long long read_result;
@@ -246,6 +337,16 @@ static int pcid_handle_cmd(struct pcid__json_object **result)
         if (ret != 0)
             goto fail;
         (*result)->string = NULL;
+    } else if (command_name == PCID_JSON_LIST_RSC) {
+        ret = handle_read_resources_cmd((*result)->string, &resources_list);
+        if (ret < 0)
+            goto fail;
+        (*result)->list_rsc = resources_list;
+    } else if (command_name == PCID_JSON_UNBIND) {
+        ret = handle_unbind_cmd((*result)->string, (*result)->info, &full_path);
+        if (ret < 0)
+            goto fail;
+        (*result)->string = full_path;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto fail;
@@ -264,6 +365,19 @@ static void free_pcid_list(struct pcid_list *list)
     if (!(LIBXL_LIST_EMPTY(&list->head))) {
         LIBXL_LIST_FOREACH(ent, &list->head, entry) {
             free(ent->val);
+            next = LIBXL_LIST_NEXT(ent, entry);
+            free(ent);
+            ent = next;
+        }
+    }
+}
+
+static void free_pcid_list_rsc(struct pcid_list_resources *list)
+{
+    struct pcid_list_resources *ent, *next;
+
+    if (!(LIBXL_LIST_EMPTY(&list->head))) {
+        LIBXL_LIST_FOREACH(ent, &list->head, entry) {
             next = LIBXL_LIST_NEXT(ent, entry);
             free(ent);
             ent = next;
@@ -329,6 +443,8 @@ static void pcid_vchan_receive_command(struct vchan_state *state)
 
     if (result->type == PCID_JSON_LIST)
         free_pcid_list(result->list);
+    else if (result->type == PCID_JSON_LIST_RSC)
+        free_pcid_list_rsc(result->list_rsc);
 }
 
 int main_pcid(int argc, char *argv[])

@@ -31,11 +31,13 @@
 #define PCID_MSG_FIELD_ARGS      "arguments"
 
 #define PCID_CMD_LIST            "ls"
+#define PCID_CMD_UNBIND          "unbind"
 #define PCID_CMD_DIR_ID          "dir_id"
 
 #define PCID_CMD_WRITE           "write"
 #define PCID_CMD_READ_HEX        "read_hex"
 #define PCID_CMD_EXISTS          "exists"
+#define PCID_CMD_READ_RESOURCES  "read_resources"
 #define PCID_CMD_PCI_PATH        "pci_path"
 #define PCID_CMD_PCI_INFO        "pci_info"
 
@@ -46,6 +48,7 @@
 
 #if defined(__linux__)
 #define SYSFS_PCIBACK_DRIVER   "/sys/bus/pci/drivers/pciback"
+#define SYSFS_PCI_DEV          "/sys/bus/pci/devices"
 #endif
 
 #define PCI_INFO_PATH "/libxl/pci"
@@ -79,6 +82,8 @@ enum pcid__json_resp_type {
     PCID_JSON_WRITE = (1 << 1),
     PCID_JSON_READ_HEX = (1 << 2),
     PCID_JSON_EXISTS = (1 << 3),
+    PCID_JSON_LIST_RSC = (1 << 4),
+    PCID_JSON_UNBIND = (1 << 5),
     PCID_JSON_ANY = 255 /* this is a mask of all values above, adjust as needed */
 };
 
@@ -88,12 +93,21 @@ struct pcid_list {
     char *val;
 };
 
+struct pcid_list_resources {
+    LIBXL_LIST_HEAD(, struct pcid_list_resources) head;
+    LIBXL_LIST_ENTRY(struct pcid_list_resources) entry;
+    long long start;
+    long long end;
+    long long flags;
+};
+
 struct pcid__json_object {
     enum pcid__json_resp_type type;
     long long i;
     char *string;
     char *info;
     struct pcid_list *list;
+    struct pcid_list_resources *list_rsc;
 };
 
 int vchan_process_message(struct vchan_state *state,
