@@ -80,6 +80,45 @@ out:
     return result;
 }
 
+static struct pcid__json_object *process_write_cmd(libxl__gc *gc,
+                                                   struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *dir_id, *pci_path, *pci_info;
+    char *full_path;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    dir_id = libxl__json_map_get(PCID_CMD_DIR_ID, args, JSON_ANY);
+    if (!dir_id)
+        goto out;
+    pci_path = libxl__json_map_get(PCID_CMD_PCI_PATH, args, JSON_ANY);
+    if (!pci_path)
+        goto out;
+    pci_info = libxl__json_map_get(PCID_CMD_PCI_INFO, args, JSON_ANY);
+    if (!pci_info)
+        goto out;
+
+    if (strcmp(dir_id->u.string, PCID_PCI_DEV) == 0)
+        full_path = libxl__sprintf(gc, SYSFS_PCI_DEV"%s", pci_path->u.string);
+    else if (strcmp(dir_id->u.string, PCID_PCIBACK_DRIVER) == 0)
+        full_path = libxl__sprintf(gc, SYSFS_PCIBACK_DRIVER"%s", pci_path->u.string);
+    else if (strcmp(dir_id->u.string, SYSFS_DRIVER_PATH) == 0)
+        full_path = pci_path->u.string;
+    else {
+        LOGE(ERROR, "Unknown write directory %s\n", dir_id->u.string);
+        goto out;
+    }
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_WRITE);
+    result->string = full_path;
+    result->info = pci_info->u.string;
+
+out:
+    return result;
+}
+
 static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
                                 struct libxl__json_object *resp,
                                 struct pcid__json_object **result)
@@ -92,6 +131,8 @@ static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
 
     if (strcmp(command_name, PCID_CMD_LIST) == 0)
        (*result) = process_ls_cmd(gc, resp);
+    else if (strcmp(PCID_CMD_WRITE, command_name) == 0)
+        (*result) = process_write_cmd(gc, resp);
     else
         LOGE(ERROR, "Unknown command: %s\n", command_name);
 
@@ -164,6 +205,11 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
                 }
             }
             yajl_gen_array_close(hand);
+        } else if (result->type == PCID_JSON_WRITE) {
+            if (result->string)
+                libxl__yajl_gen_asciiz(hand, result->string);
+            else
+                libxl__yajl_gen_asciiz(hand, "success");
         } else
             LOGE(ERROR, "Unknown result type\n");
     }

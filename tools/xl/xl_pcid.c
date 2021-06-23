@@ -160,6 +160,26 @@ out:
     return 1;
 }
 
+static int handle_write_cmd(char *sysfs_path, char *pci_info)
+{
+    int rc, fd;
+
+    fd = open(sysfs_path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Couldn't open %s\n", sysfs_path);
+        return ERROR_FAIL;
+    }
+
+    rc = write(fd, pci_info, strlen(pci_info));
+    close(fd);
+    if (rc < 0) {
+        fprintf(stderr, "write to %s returned %d\n", sysfs_path, rc);
+        return ERROR_FAIL;
+    }
+
+    return 0;
+}
+
 static int pcid_handle_cmd(struct pcid__json_object **result)
 {
     struct pcid_list *dir_list = NULL;
@@ -171,6 +191,11 @@ static int pcid_handle_cmd(struct pcid__json_object **result)
         if (ret)
             goto fail;
         (*result)->list = dir_list;
+    } else if (command_name == PCID_JSON_WRITE) {
+        ret = handle_write_cmd((*result)->string, (*result)->info);
+        if (ret != 0)
+            goto fail;
+        (*result)->string = NULL;
     } else {
         fprintf(stderr, "Unknown command\n");
         goto fail;

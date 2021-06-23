@@ -33,7 +33,14 @@
 #define PCID_CMD_LIST            "ls"
 #define PCID_CMD_DIR_ID          "dir_id"
 
+#define PCID_CMD_WRITE           "write"
+#define PCID_CMD_PCI_PATH        "pci_path"
+#define PCID_CMD_PCI_INFO        "pci_info"
+
 #define PCID_PCIBACK_DRIVER      "pciback_driver"
+#define PCID_PCI_DEV             "pci_dev"
+
+#define SYSFS_DRIVER_PATH        "driver_path"
 
 #if defined(__linux__)
 #define SYSFS_PCIBACK_DRIVER   "/sys/bus/pci/drivers/pciback"
@@ -67,6 +74,7 @@ struct vchan_state {
 
 enum pcid__json_resp_type {
     PCID_JSON_LIST = (1 << 0),
+    PCID_JSON_WRITE = (1 << 1),
     PCID_JSON_ANY = 255 /* this is a mask of all values above, adjust as needed */
 };
 
@@ -80,6 +88,7 @@ struct pcid__json_object {
     enum pcid__json_resp_type type;
     long long i;
     char *string;
+    char *info;
     struct pcid_list *list;
 };
 
