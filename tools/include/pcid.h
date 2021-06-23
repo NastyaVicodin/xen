@@ -66,13 +66,21 @@ struct vchan_state {
 };
 
 enum pcid__json_resp_type {
+    PCID_JSON_LIST = (1 << 0),
     PCID_JSON_ANY = 255 /* this is a mask of all values above, adjust as needed */
+};
+
+struct pcid_list {
+    LIBXL_LIST_HEAD(, struct pcid_list) head;
+    LIBXL_LIST_ENTRY(struct pcid_list) entry;
+    char *val;
 };
 
 struct pcid__json_object {
     enum pcid__json_resp_type type;
     long long i;
     char *string;
+    struct pcid_list *list;
 };
 
 int vchan_process_message(struct vchan_state *state,

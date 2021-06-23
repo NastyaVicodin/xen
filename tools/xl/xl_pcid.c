@@ -113,6 +113,89 @@ static struct vchan_state *vchan_get_instance(void)
     return state;
 }
 
+static int handle_ls_command(char *dir_name, struct pcid_list **result)
+{
+    struct pcid_list *dir_list, *node = NULL;
+    struct dirent *de;
+    DIR *dir = NULL;
+
+    if (strcmp(PCID_PCIBACK_DRIVER, dir_name) == 0)
+        dir = opendir(SYSFS_PCIBACK_DRIVER);
+    else {
+        fprintf(stderr, "Unknown directory: %s\n", dir_name);
+        goto out;
+    }
+
+    if (dir == NULL) {
+        if (errno == ENOENT)
+            fprintf(stderr, "Looks like pciback driver not loaded\n");
+        else
+            fprintf(stderr, "Couldn't open\n");
+        goto out;
+    }
+
+    dir_list = pcid_zalloc(sizeof(*dir_list));
+    if (!dir_list)
+        goto out_mem_fail;
+    LIBXL_LIST_INIT(&dir_list->head);
+    while ((de = readdir(dir))) {
+        node = pcid_zalloc(sizeof(*node));
+        if (!node)
+            goto out_mem_fail;
+        node->val = strdup(de->d_name);
+        LIBXL_LIST_INSERT_HEAD(&dir_list->head, node, entry);
+    }
+
+    closedir(dir);
+
+    *result = dir_list;
+
+    return 0;
+
+out_mem_fail:
+    closedir(dir);
+    fprintf(stderr, "Memory allocation failed\n");
+out:
+    fprintf(stderr, "LS command failed\n");
+    return 1;
+}
+
+static int pcid_handle_cmd(struct pcid__json_object **result)
+{
+    struct pcid_list *dir_list = NULL;
+    int ret;
+    int command_name = (*result)->type;
+
+    if (command_name == PCID_JSON_LIST) {
+        ret = handle_ls_command((*result)->string, &dir_list);
+        if (ret)
+            goto fail;
+        (*result)->list = dir_list;
+    } else {
+        fprintf(stderr, "Unknown command\n");
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    return 1;
+}
+
+static void free_pcid_list(struct pcid_list *list)
+{
+    struct pcid_list *ent, *next;
+
+    if (!(LIBXL_LIST_EMPTY(&list->head))) {
+        LIBXL_LIST_FOREACH(ent, &list->head, entry) {
+            free(ent->val);
+            next = LIBXL_LIST_NEXT(ent, entry);
+            free(ent);
+            ent = next;
+        }
+    }
+}
+
 static void pcid_vchan_receive_command(struct vchan_state *state)
 {
     struct pcid__json_object *result = NULL;
@@ -150,6 +233,10 @@ static void pcid_vchan_receive_command(struct vchan_state *state)
     if (ret != 0)
         return;
 
+    ret = pcid_handle_cmd(&result);
+    if (ret)
+        return;
+
     reply = vchan_prepare_reply(result, 0);
     if (!reply) {
         fprintf(stderr, "Reply preparing failed\n");
@@ -164,6 +251,9 @@ static void pcid_vchan_receive_command(struct vchan_state *state)
         memset(outbuf, 0, BUFSIZE);
 
     vchan_wr(reply);
+
+    if (result->type == PCID_JSON_LIST)
+        free_pcid_list(result->list);
 }
 
 int main_pcid(int argc, char *argv[])

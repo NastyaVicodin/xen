@@ -49,6 +49,37 @@ static int vchan_get_next_msg(libxl__gc *gc, struct vchan_state *state,
     return 0;
 }
 
+static struct pcid__json_object *pcid__json_object_alloc(libxl__gc *gc,
+                                                         enum pcid__json_resp_type type)
+{
+    struct pcid__json_object *obj;
+
+    obj = libxl__zalloc(gc, sizeof(*obj));
+    obj->type = type;
+
+    return obj;
+}
+
+static struct pcid__json_object *process_ls_cmd(libxl__gc *gc,
+                                                struct libxl__json_object *resp)
+{
+    struct pcid__json_object *result = NULL;
+    const struct libxl__json_object *args, *dir_id;
+
+    args = libxl__json_map_get(PCID_MSG_FIELD_ARGS, resp, JSON_MAP);
+    if (!args)
+        goto out;
+    dir_id = libxl__json_map_get(PCID_CMD_DIR_ID, args, JSON_ANY);
+    if (!dir_id)
+        goto out;
+
+    result = pcid__json_object_alloc(gc, PCID_JSON_LIST);
+    result->string = dir_id->u.string;
+
+out:
+    return result;
+}
+
 static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
                                 struct libxl__json_object *resp,
                                 struct pcid__json_object **result)
@@ -58,6 +89,16 @@ static int vchan_handle_message(libxl__gc *gc, struct vchan_state *state,
 
     command_obj = libxl__json_map_get(PCID_MSG_EXECUTE, resp, JSON_ANY);
     command_name = command_obj->u.string;
+
+    if (strcmp(command_name, PCID_CMD_LIST) == 0)
+       (*result) = process_ls_cmd(gc, resp);
+    else
+        LOGE(ERROR, "Unknown command: %s\n", command_name);
+
+    if (!(*result)) {
+        LOGE(ERROR, "Message handling failed\n");
+        return 1;
+    }
 
     return 0;
 }
@@ -96,6 +137,7 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
     libxl_yajl_length len;
     yajl_gen_status s;
     char *ret = NULL;
+    struct pcid_list *resp_list, *value;
 
     hand = libxl_yajl_gen_alloc(NULL);
     if (!hand) {
@@ -111,10 +153,20 @@ char *vchan_prepare_reply(struct pcid__json_object *result,
     yajl_gen_map_open(hand);
     if ( !result )
         libxl__yajl_gen_asciiz(hand, PCID_MSG_ERROR);
-    else
+    else {
         libxl__yajl_gen_asciiz(hand, PCID_MSG_RETURN);
-    yajl_gen_array_open(hand);
-    yajl_gen_array_close(hand);
+        if (result->type == PCID_JSON_LIST) {
+            resp_list = result->list;
+            yajl_gen_array_open(hand);
+            if (!(LIBXL_LIST_EMPTY(&resp_list->head))) {
+                LIBXL_LIST_FOREACH(value, &resp_list->head, entry) {
+                    libxl__yajl_gen_asciiz(hand, value->val);
+                }
+            }
+            yajl_gen_array_close(hand);
+        } else
+            LOGE(ERROR, "Unknown result type\n");
+    }
     libxl__yajl_gen_asciiz(hand, PCID_MSG_FIELD_ID);
     yajl_gen_integer(hand, id);
     yajl_gen_map_close(hand);
