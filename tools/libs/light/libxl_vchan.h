@@ -27,6 +27,8 @@
 #define END_OF_MESSAGE "\r\n"
 
 #define VCHAN_MSG_EXECUTE         "execute"
+#define VCHAN_MSG_RETURN          "return"
+#define VCHAN_MSG_ERROR           "error"
 
 struct vchan_state {
     /* Server domain ID. */
